@@ -791,4 +791,151 @@ dictionary.unknown=unknownEntry;
 resetDemoData();dispatch('preferences.set',{role:'visitor',lang:'ar'});
 console.log(`P4 render smoke: ${p4Renders} renders`);
 
+// ---------------------------------------------------------------- P5 guardian portal
+const p5Reset=(role='guardian')=>{resetDemoData();dispatch('preferences.set',{role,lang:'ar'});};
+const guardianRoute=path=>routes.find(r=>r.path===path);
+const p5Render=(path,params={},query='')=>{const route=guardianRoute(path),ctx={params,query:new URLSearchParams(query),role:getState().preferences.role,actor:select('actor'),route,path:path.replace(':id',params.id??''),dispatch,navigate:()=>{}};for(const [key,values] of Object.entries(route.queryValues))if(ctx.query.has(key)&&!values.includes(ctx.query.get(key)))ctx.query.set(key,values[0]);return {html:route.view.render(ctx),ctx};};
+const childIds=()=>select('guardian.dashboard').children.map(c=>c.child.id);
+const link=id=>getState().guardian_student_links.find(l=>l.id===id);
+check('P5 seed: exactly S-001/S-002 verified; S-003 pending and S-004 revoked never return child detail',()=>{
+ p5Reset();
+ assert.deepEqual(childIds(),['S-001','S-002']);assert.deepEqual(select('guardian.childrenPage').children.map(c=>c.child.id),['S-001','S-002']);assert.deepEqual(select('guardian.children').map(s=>s.id),['S-001','S-002']);
+ for(const id of ['S-003','S-004','S-005'])assert.equal(select('guardian.child',{id}).status,'denied',id);
+ assert.equal(select('guardian.child',{id:'S-999'}).status,'missing');
+ const requests=select('guardian.childrenPage').requests;assert.deepEqual(requests.map(r=>[r.id,r.state]),[['GL-003','pending_verification'],['GL-004','revoked']]);
+ assert.ok(requests.every(r=>!('name' in r)&&!('student_id' in r)&&!('percent' in r)),'status-only requests');
+ assert.ok(!JSON.stringify(requests).includes('Hamad')&&!JSON.stringify(requests).includes('Fatma'));
+ assert.deepEqual(select('guardian.dashboard').requests,{total:2,requested:0,pending_verification:1,rejected:0,revoked:1});
+ const maryam=select('guardian.child',{id:'S-001'});assert.equal(maryam.status,'ok');assert.ok(maryam.courses.length>0);assert.ok(maryam.courses.every(r=>r.percent>=0&&r.percent<=100));
+ assert.equal(maryam.percent,Math.round(maryam.done*100/maryam.total));
+ assert.deepEqual(select('guardian.purchaseChildren').map(c=>c.id),['S-001','S-002']);
+});
+check('P5 guardian summaries never carry paid content, submissions or private messages',()=>{
+ p5Reset();const json=JSON.stringify([select('guardian.dashboard'),select('guardian.child',{id:'S-001'}),select('guardian.child',{id:'S-002'})]);
+ const s=getState(),enrolled=new Set(s.enrollments.filter(e=>['S-001','S-002'].includes(e.student_id)).map(e=>e.course_id));
+ const lessons=s.lessons.filter(l=>enrolled.has(s.modules.find(m=>m.id===l.module_id).course_id)&&!l.preview);
+ for(const l of lessons)assert.ok(!json.includes(JSON.stringify(l.body.en).slice(1,-1)),l.id);
+ for(const x of s.submissions.filter(x=>['S-001','S-002'].includes(x.student_id)))assert.ok(!json.includes(x.text),x.id);
+ for(const m of s.messages)assert.ok(!json.includes(m.text),m.id);
+ assert.equal(select('student.room',{courseId:'C-002'}).status,'denied');assert.equal(select('student.thread',{id:'Q-001'}).status,'denied');assert.deepEqual(select('student.conversations'),[]);
+ assert.ok(!guardianRoute('/student/course/:id').roles.includes('guardian'));assert.ok(!guardianRoute('/student/messages/:id').roles.includes('guardian'));
+ assert.equal(can('read_content',course('C-002')),false);assert.equal(can('conversation.read',getState().conversations.find(q=>q.id==='Q-001')),false);
+});
+check('P5 OMAN-S003 reuses the pending request and grants nothing; bad codes and consent fail atomically',()=>{
+ p5Reset();const before=getState();
+ for(const [payload,field,key] of [[{code:'OMAN-S999',relationship:'aunt',consent:true},'code','p5.codeInvalid'],[{code:'عمان-٣',relationship:'aunt',consent:true},'code','p5.codeInvalid'],[{code:'Hamad',relationship:'aunt',consent:true},'code','p5.codeInvalid'],[{code:'',relationship:'aunt',consent:true},'code','error.required'],[{code:'OMAN-S003',relationship:'boss',consent:true},'relationship','p5.relationshipRequired'],[{code:'OMAN-S003',relationship:'aunt'},'consent','error.consent']]){
+  const r=dispatch('guardian.requestLink',payload);assert.equal(r.ok,false);assert.equal(r.fieldErrors[field],key,JSON.stringify(payload));assert.equal(getState(),before);
+ }
+ const r=dispatch('guardian.requestLink',{code:' oman-s003 ',relationship:'aunt',consent:'on'});assert.ok(r.ok);assert.deepEqual(r.data,{linkId:'GL-003',reused:true,state:'pending_verification'});
+ assert.equal(getState().guardian_student_links.length,6);assert.equal(select('guardian.linkResult').id,'GL-003');
+ assert.equal(select('guardian.child',{id:'S-003'}).status,'denied');assert.deepEqual(childIds(),['S-001','S-002']);assert.equal(select('checkout.context',{courseId:'C-001',studentId:'S-003'}).status,'denied');
+ assert.equal(dispatch('guardianLink.verify',{linkId:'GL-003'}).errorKey,'resourceDenied','guardian never self-verifies');
+ const again=dispatch('guardian.requestLink',{code:'OMAN-S004',relationship:'aunt',consent:true});assert.ok(again.ok&&!again.data.reused,'revoked link needs a new request');
+ assert.equal(link(again.data.linkId).state,'pending_verification');assert.equal(link('GL-004').state,'revoked');assert.equal(select('guardian.child',{id:'S-004'}).status,'denied');
+ assert.equal(getState().audit_events.at(-1).action,'guardian_link.request');
+ assert.ok(dispatch('guardian.requestLink',{code:'OMAN-S001',relationship:'mother',consent:true}).data.state==='verified');
+});
+check('P5 staff verify (admin_moderation) makes S-003 visible; other roles cannot verify',()=>{
+ p5Reset();dispatch('guardian.requestLink',{code:'OMAN-S003',relationship:'aunt',consent:true});
+ for(const role of ['admin_finance','teacher','student','visitor']){dispatch('preferences.set',{role});assert.equal(dispatch('guardianLink.verify',{linkId:'GL-003'}).ok,false,role);}
+ dispatch('preferences.set',{role:'admin_moderation'});const audits=getState().audit_events.length;
+ const r=dispatch('guardianLink.verify',{linkId:'GL-003'});assert.ok(r.ok);assert.equal(link('GL-003').verified_by,'U-M001');assert.equal(getState().audit_events.length,audits+1);
+ assert.equal(dispatch('guardianLink.verify',{linkId:'GL-003'}).errorKey,'p5.invalidTransition');assert.equal(dispatch('guardianLink.verify',{linkId:'GL-004'}).errorKey,'p5.invalidTransition','revoked cannot be re-verified');
+ dispatch('preferences.set',{role:'guardian'});
+ assert.deepEqual(childIds(),['S-001','S-002','S-003']);const hamad=select('guardian.child',{id:'S-003'});assert.equal(hamad.status,'ok');assert.ok(hamad.has.progress&&hamad.has.results&&hamad.has.attendance);
+ assert.ok(select('checkout.context',{courseId:'C-005'}).children.some(c=>c.id==='S-003'));
+ assert.ok(select('guardian.notifications').some(n=>n.href==='#/guardian/child/S-003'));
+ assert.equal(p5Render('/guardian/child/:id',{id:'S-003'}).html.includes(esc(L(student('S-003').name))),true);
+});
+check('P5 revoking S-002 removes it everywhere immediately and appends an audit event',()=>{
+ p5Reset();const audits=getState().audit_events.length;
+ assert.equal(dispatch('guardian.revokeLink',{linkId:'GL-005'}).errorKey,'resourceDenied','other guardian link');assert.equal(dispatch('guardian.revokeLink',{linkId:'GL-003'}).errorKey,'p5.notVerified');
+ assert.ok(dispatch('guardian.revokeLink',{linkId:'GL-002'}).ok);
+ assert.deepEqual(childIds(),['S-001']);assert.deepEqual(select('checkout.context',{courseId:'C-001'}).children.map(c=>c.id),['S-001']);
+ assert.equal(select('checkout.context',{courseId:'C-001',studentId:'S-002'}).status,'denied');assert.equal(makeOrder('C-001','S-002').ok,false);
+ assert.equal(select('guardian.child',{id:'S-002'}).status,'denied');
+ const {html,ctx}=p5Render('/guardian/child/:id',{id:'S-002'},'tab=activity');assert.equal(html,fallback('resourceDenied',ctx));assert.ok(!html.includes(esc(L(student('S-002').name))));
+ const ev=getState().audit_events.at(-1);assert.equal(getState().audit_events.length,audits+1);assert.deepEqual([ev.actor_user_id,ev.action,ev.resource_id,ev.before_summary,ev.after_summary],['U-G001','guardian_link.revoke','GL-002','verified','revoked']);
+ assert.equal(dispatch('guardian.revokeLink',{linkId:'GL-002'}).errorKey,'p5.notVerified');
+ assert.ok(select('guardian.orders').some(d=>d.order.id==='ORD-002'),'historical receipt remains');assert.equal(select('checkout.order',{orderId:'ORD-002'}).status,'ok');
+ assert.deepEqual(select('guardian.purchaseChildren').map(c=>c.id),['S-001']);
+ assert.ok(dispatch('guardian.revokeLink',{linkId:'GL-001'}).ok);assert.ok(!select('guardian.notifications').some(n=>n.id==='N-009'),'revoked child summary notice hidden');
+ assert.ok(select('guardian.notifications').some(n=>n.id==='N-006'),'payment notice kept');assert.equal(select('notifications.count'),select('guardian.notifications').filter(n=>!n.read_at).length);
+});
+check('P5 G-002 cannot see G-001-only children',()=>{
+ p5Reset();const saved={...PERSONAS.guardian};Object.assign(PERSONAS.guardian,{user_id:'U-G002',record_id:'G-002'});
+ try{
+  assert.deepEqual(childIds(),['S-001']);for(const id of ['S-002','S-003','S-004','S-005'])assert.equal(select('guardian.child',{id}).status,'denied',id);
+  assert.deepEqual(select('guardian.childrenPage').requests.map(r=>r.id),['GL-006']);assert.deepEqual(select('guardian.orders'),[]);
+  assert.equal(dispatch('guardian.revokeLink',{linkId:'GL-002'}).errorKey,'resourceDenied');assert.equal(select('checkout.context',{courseId:'C-001',studentId:'S-002'}).status,'denied');
+  assert.deepEqual(select('support.tickets'),[]);assert.equal(select('support.ticket',{id:'ST-001'}).status,'denied');
+ }finally{Object.assign(PERSONAS.guardian,saved);}
+ assert.deepEqual(childIds(),['S-001','S-002']);
+});
+check('P5 scope change is a moderator request; current scopes stay in force',()=>{
+ p5Reset();
+ assert.equal(dispatch('guardian.requestScopeChange',{linkId:'GL-001',scopes:[...['progress','results','attendance','purchase']]}).fieldErrors.scopes,'p5.scopesUnchanged');
+ assert.equal(dispatch('guardian.requestScopeChange',{linkId:'GL-001',scopes:['bogus']}).fieldErrors.scopes,'p5.scopesRequired');
+ assert.equal(dispatch('guardian.requestScopeChange',{linkId:'GL-003',scopes:['progress']}).errorKey,'p5.notVerified');
+ const notes=getState().notifications.length,r=dispatch('guardian.requestScopeChange',{linkId:'GL-001',scopes:['results','progress']});assert.ok(r.ok);assert.deepEqual(r.data.scopes,['progress','results']);
+ assert.deepEqual(link('GL-001').scopes,['progress','results','attendance','purchase']);assert.equal(link('GL-001').scope_request.state,'pending_verification');
+ assert.ok(getState().notifications.slice(notes).every(n=>n.recipient_user_id==='U-M001'));assert.ok(select('guardian.child',{id:'S-001'}).has.attendance);
+ assert.equal(select('guardian.settings').links.find(l=>l.id==='GL-001').scope_request.scopes.length,2);
+});
+check('P5 support tickets: own list, create, reply/reopen, other tickets denied',()=>{
+ p5Reset();assert.deepEqual(select('support.tickets').map(x=>x.id),['ST-001']);assert.equal(select('support.ticket',{id:'ST-002'}).status,'denied');assert.equal(select('support.ticket',{id:'ST-999'}).status,'missing');
+ const r=dispatch('support.createTicket',{topic:'payment',subject:'Receipt copy',body:'Please resend the receipt for my order.'});assert.ok(r.ok);
+ assert.equal(select('support.ticket',{id:r.data.ticketId}).ticket.requester_user_id,'U-G001');
+ assert.ok(dispatch('support.reply',{ticketId:'ST-001',text:'Thank you, any update?'}).ok);assert.equal(select('support.ticket',{id:'ST-001'}).ticket.replies.length,1);
+ assert.equal(dispatch('support.reply',{ticketId:'ST-002',text:'Let me in'}).errorKey,'resourceDenied');assert.ok(dispatch('support.reply',{ticketId:'ST-001',text:''}).fieldErrors.text);
+ assert.ok(dispatch('guardian.updateSettings',{prefs:{in_app:true,payments:'on'}}).ok);assert.deepEqual(select('guardian.settings').prefs,{in_app:true,email_digest:false,weekly_summary:false,payments:true,live_reminders:false});
+ dispatch('preferences.set',{role:'student'});assert.equal(dispatch('guardian.requestLink',{code:'OMAN-S003',relationship:'aunt',consent:true}).errorKey,'p5.guardianOnly');assert.equal(select('guardian.dashboard'),null);
+});
+let p5Renders=0;
+dictionary.unknown={ar:'MISSING_DICTIONARY_KEY',en:'MISSING_DICTIONARY_KEY'};
+for(const lang of ['ar','en']){
+ p5Reset();dispatch('preferences.set',{lang});
+ const run=list=>{for(const [path,params={},query=''] of list)check(`P5 render ${lang} ${path} ${JSON.stringify(params)} ${query}`,()=>{
+  const before=getState(),{html}=p5Render(path,params,query);p5Renders++;assert.equal(getState(),before,'render is read-only');assert.ok(html.length>0);
+  assert.doesNotMatch(html,/undefined|NaN|\[object Object\]|MISSING_DICTIONARY_KEY/);assert.doesNotMatch(html.replace(/<[^>]+>/g,' '),/\b(?:p2|p3|p4|p5|error|status|route)\.[\w./:-]+/);
+ });};
+ const cases=[['/guardian'],['/guardian',{},'child=S-002'],['/guardian',{},'child=S-003'],['/guardian/children'],['/guardian/children/link'],['/guardian/explore'],['/guardian/explore',{},'child=S-001'],['/guardian/explore',{},'child=S-002&all=1'],['/guardian/explore',{},'child=S-003'],['/guardian/orders'],['/guardian/notifications'],['/guardian/notifications',{},'filter=unread'],['/guardian/support'],['/guardian/support',{},'record=ST-001'],['/guardian/child/:id',{id:'S-001'},'tab=bogus']];
+ for(const tab of guardianRoute('/guardian/settings').queryValues.tab)cases.push(['/guardian/settings',{},'tab='+tab]);
+ for(const id of ['S-001','S-002'])for(const tab of guardianRoute('/guardian/child/:id').queryValues.tab)cases.push(['/guardian/child/:id',{id},'tab='+tab]);
+ run(cases);
+ check(`P5 render ${lang} denied and missing states leak no names`,()=>{
+  for(const [path,params,query,kind] of [['/guardian/child/:id',{id:'S-003'},'','resourceDenied'],['/guardian/child/:id',{id:'S-004'},'tab=results','resourceDenied'],['/guardian/child/:id',{id:'S-005'},'','resourceDenied'],['/guardian/child/:id',{id:'S-999'},'','missing'],['/guardian/support',{},'record=ST-002','resourceDenied'],['/guardian/support',{},'record=ST-999','missing']]){
+   const {html,ctx}=p5Render(path,params,query);p5Renders++;assert.equal(html,fallback(kind,ctx));for(const s of getState().students.filter(x=>!['S-001','S-002'].includes(x.id)))assert.ok(!html.includes(esc(L(s.name))));
+  }
+  // Own historical receipts may keep a beneficiary snapshot (ORD-004 for S-004); request lists and child cards never name unverified learners.
+  const children=p5Render('/guardian/children').html,dash=p5Render('/guardian').html;
+  for(const s of ['S-003','S-004'])assert.ok(!children.includes(esc(L(student(s).name))),s);assert.ok(!dash.includes(esc(L(student('S-003').name))));
+  const explore=p5Render('/guardian/explore',{},'child=S-001').html;assert.match(explore,/#\/checkout\/C-\d+\/beneficiary\?child=S-001/);assert.doesNotMatch(explore,/beneficiary\?child=S-00[2-6]/);
+  assert.ok(!p5Render('/guardian/explore',{},'child=S-003').html.includes('beneficiary?child='),'unverified child carries nothing');
+  assert.ok(!p5Render('/guardian/child/:id',{id:'S-001'},'tab=courses').html.includes('#/student/'),'no player links');
+  assert.ok(p5Render('/guardian/child/:id',{id:'S-001'}).html.includes('#/guardian/explore?child=S-001'));
+  assert.ok(p5Render('/guardian/orders').html.includes('#/checkout/order/ORD-006/provider'),'failed order recovery');
+ });
+ // Link form with errors, a reused request, verification, a scope request, a new ticket and a revocation.
+ dispatch('form.save',{form:'guardian-link',values:{code:'BAD',relationship:''},fieldErrors:dispatch('guardian.requestLink',{code:'BAD'}).fieldErrors});
+ run([['/guardian/children/link']]);
+ dispatch('guardian.requestLink',{code:'OMAN-S003',relationship:'aunt',consent:true});dispatch('guardian.requestScopeChange',{linkId:'GL-001',scopes:['progress']});
+ dispatch('support.reply',{ticketId:'ST-001',text:'Any update please?'});dispatch('preferences.set',{role:'admin_moderation'});dispatch('guardianLink.verify',{linkId:'GL-003'});dispatch('preferences.set',{role:'guardian'});
+ dispatch('guardian.revokeLink',{linkId:'GL-002'});
+ run([['/guardian'],['/guardian/children/link'],['/guardian/children'],['/guardian/settings',{},'tab=links'],['/guardian/support',{},'record=ST-001'],['/guardian/child/:id',{id:'S-003'},'tab=activity'],['/guardian/child/:id',{id:'S-003'},'tab=live'],['/guardian/explore',{},'child=S-003']]);
+}
+// A results-only link (isolated fixture) shows explicit missing-scope states rather than data.
+{
+ const fixtureSource=storeSource.replace("'./data.js'",JSON.stringify(new URL('../prototype/core/data.js',import.meta.url).href)).replaceAll('...createSeed()','...fixtureSeed()')+`\nfunction fixtureSeed(){const s=createSeed();s.guardian_student_links.find(l=>l.id==='GL-002').scopes=['results'];return s;}`;
+ const iso=await import('data:text/javascript;base64,'+Buffer.from(fixtureSource).toString('base64'));
+ check('P5 scopes gate each child section and purchase',()=>{
+  iso.dispatch('preferences.set',{role:'guardian'});const c=iso.select('guardian.child',{id:'S-002'});
+  assert.equal(c.status,'ok');assert.deepEqual([c.courses,c.upcoming,c.attendance,c.weeks],[[],[],[],[]]);assert.ok(c.has.results&&!c.has.progress&&!c.has.purchase);
+  assert.deepEqual(iso.select('checkout.context',{courseId:'C-001'}).children.map(x=>x.id),['S-001']);assert.equal(iso.can('child.read',iso.getState().students.find(s=>s.id==='S-002')),false);
+ });
+}
+dictionary.unknown=unknownEntry;
+resetDemoData();dispatch('preferences.set',{role:'visitor',lang:'ar'});
+console.log(`P5 render smoke: ${p5Renders} renders`);
+
 console.log(`${passed} checks passed${process.exitCode ? ' (with failures above)' : ''}`);

@@ -1,6 +1,7 @@
 import { beneficiary, review, provider, result, receipt, registerActions as checkoutActions } from '../views/checkout.js';
 import { signIn, resetPassword, registration, teacherApplication, registerActions as authActions } from '../views/auth.js';
 import * as student from '../views/student.js';
+import * as guardian from '../views/guardian.js';
 import { home, explore, grade, subject, course, teachers, teacher, become, about, help, legal, registerActions as publicActions } from '../views/public.js';
 import { getState, select, dispatch, subscribe } from './store.js';
 import { t, L, esc } from './i18n.js';
@@ -43,15 +44,15 @@ export const routes = [
 {"path": "/student/notifications", "roles": ["student"], "title": {"ar": "الإشعارات", "en": "Notifications"}, "module": "student", "phase": 4, "titleKey": "route./student/notifications", "queryValues": {}, "view": student.notifications},
 {"path": "/student/profile", "roles": ["student"], "title": {"ar": "الملف التعليمي", "en": "Learning profile"}, "module": "student", "phase": 4, "titleKey": "route./student/profile", "queryValues": {}, "view": student.profile},
 {"path": "/student/settings", "roles": ["student"], "title": {"ar": "الحساب والخصوصية", "en": "Account and privacy"}, "module": "student", "phase": 4, "titleKey": "route./student/settings", "queryValues": {"tab": ["account", "privacy", "notifications"]}, "view": student.settings},
-{"path": "/guardian", "roles": ["guardian"], "title": {"ar": "لوحة ولي الأمر", "en": "Guardian dashboard"}, "module": "guardian", "phase": 5, "titleKey": "route./guardian", "queryValues": {}, "view": future},
-{"path": "/guardian/children", "roles": ["guardian"], "title": {"ar": "أبنائي", "en": "My children"}, "module": "guardian", "phase": 5, "titleKey": "route./guardian/children", "queryValues": {}, "view": future},
-{"path": "/guardian/children/link", "roles": ["guardian"], "title": {"ar": "ربط طالب والتحقق", "en": "Link and verify child"}, "module": "guardian", "phase": 5, "titleKey": "route./guardian/children/link", "queryValues": {}, "view": future},
-{"path": "/guardian/child/:id", "roles": ["guardian"], "title": {"ar": "متابعة الطالب", "en": "Child dashboard"}, "module": "guardian", "phase": 5, "titleKey": "route./guardian/child/:id", "queryValues": {"tab": ["courses", "results", "live", "activity"]}, "view": future},
-{"path": "/guardian/explore", "roles": ["guardian"], "title": {"ar": "شراء دورة لطالب", "en": "Explore for a child"}, "module": "guardian", "phase": 5, "titleKey": "route./guardian/explore", "queryValues": {}, "view": future},
-{"path": "/guardian/orders", "roles": ["guardian"], "title": {"ar": "الطلبات والإيصالات", "en": "Orders and receipts"}, "module": "guardian", "phase": 5, "titleKey": "route./guardian/orders", "queryValues": {}, "view": future},
-{"path": "/guardian/notifications", "roles": ["guardian"], "title": {"ar": "الإشعارات", "en": "Notifications"}, "module": "guardian", "phase": 5, "titleKey": "route./guardian/notifications", "queryValues": {}, "view": future},
-{"path": "/guardian/support", "roles": ["guardian"], "title": {"ar": "الدعم", "en": "Support"}, "module": "guardian", "phase": 5, "titleKey": "route./guardian/support", "queryValues": {}, "view": future},
-{"path": "/guardian/settings", "roles": ["guardian"], "title": {"ar": "الإعدادات وصلاحيات الربط", "en": "Settings and link permissions"}, "module": "guardian", "phase": 5, "titleKey": "route./guardian/settings", "queryValues": {"tab": ["account", "links", "notifications"]}, "view": future},
+{"path": "/guardian", "roles": ["guardian"], "title": {"ar": "لوحة ولي الأمر", "en": "Guardian dashboard"}, "module": "guardian", "phase": 5, "titleKey": "route./guardian", "queryValues": {}, "view": guardian.dashboard},
+{"path": "/guardian/children", "roles": ["guardian"], "title": {"ar": "أبنائي", "en": "My children"}, "module": "guardian", "phase": 5, "titleKey": "route./guardian/children", "queryValues": {}, "view": guardian.children},
+{"path": "/guardian/children/link", "roles": ["guardian"], "title": {"ar": "ربط طالب والتحقق", "en": "Link and verify child"}, "module": "guardian", "phase": 5, "titleKey": "route./guardian/children/link", "queryValues": {}, "view": guardian.link},
+{"path": "/guardian/child/:id", "roles": ["guardian"], "title": {"ar": "متابعة الطالب", "en": "Child dashboard"}, "module": "guardian", "phase": 5, "titleKey": "route./guardian/child/:id", "queryValues": {"tab": ["courses", "results", "live", "activity"]}, "view": guardian.child},
+{"path": "/guardian/explore", "roles": ["guardian"], "title": {"ar": "شراء دورة لطالب", "en": "Explore for a child"}, "module": "guardian", "phase": 5, "titleKey": "route./guardian/explore", "queryValues": {}, "view": guardian.explore},
+{"path": "/guardian/orders", "roles": ["guardian"], "title": {"ar": "الطلبات والإيصالات", "en": "Orders and receipts"}, "module": "guardian", "phase": 5, "titleKey": "route./guardian/orders", "queryValues": {}, "view": guardian.orders},
+{"path": "/guardian/notifications", "roles": ["guardian"], "title": {"ar": "الإشعارات", "en": "Notifications"}, "module": "guardian", "phase": 5, "titleKey": "route./guardian/notifications", "queryValues": {}, "view": guardian.notifications},
+{"path": "/guardian/support", "roles": ["guardian"], "title": {"ar": "الدعم", "en": "Support"}, "module": "guardian", "phase": 5, "titleKey": "route./guardian/support", "queryValues": {}, "view": guardian.support},
+{"path": "/guardian/settings", "roles": ["guardian"], "title": {"ar": "الإعدادات وصلاحيات الربط", "en": "Settings and link permissions"}, "module": "guardian", "phase": 5, "titleKey": "route./guardian/settings", "queryValues": {"tab": ["account", "links", "notifications"]}, "view": guardian.settings},
 {"path": "/teacher", "roles": ["teacher"], "title": {"ar": "لوحة المعلم", "en": "Teacher dashboard"}, "module": "teacher", "phase": 6, "titleKey": "route./teacher", "queryValues": {}, "view": future},
 {"path": "/teacher/courses", "roles": ["teacher"], "title": {"ar": "دوراتي التعليمية", "en": "My teaching courses"}, "module": "teacher", "phase": 6, "titleKey": "route./teacher/courses", "queryValues": {}, "view": future},
 {"path": "/teacher/courses/new", "roles": ["teacher"], "title": {"ar": "إنشاء دورة", "en": "Create course"}, "module": "teacher", "phase": 6, "titleKey": "route./teacher/courses/new", "queryValues": {"step": ["identity", "academics", "content", "assessments", "live", "access", "review"]}, "view": future},
@@ -120,6 +121,8 @@ function resourceGuard(route,params) {
  if(route.module==='checkout')return null;
  // The learning room resolves its own scope: locked purchase recovery, lapsed-grant recovery or scoped denial.
  if(p==='/student/course/:id')return null;
+ // The child dashboard re-evaluates its verified link and per-tab scopes itself (missing vs scoped denial).
+ if(p==='/guardian/child/:id')return null;
  if(params.gradeId&&!s.grades.some(x=>x.id===params.gradeId))return 'missing';
  if(route.module==='public' && ['/course/:id','/teacher/:id','/explore/grade/:gradeId/subject/:subjectId'].includes(p))return null;
  if(params.subjectId&&!s.subjects.some(x=>x.id===params.subjectId))return 'missing';
@@ -170,6 +173,6 @@ function delegate(event) { const target=event.target instanceof Element?event.ta
  if(event.type==='submit'||(event.type==='click'&&!el.matches('a[href]')))event.preventDefault();
  try {handler(event,el,ctx);}catch(error){console.error('Action failed',error);}
 }
-export function startRouter() { if(started)return;started=true;publicActions(registerActions);authActions(registerActions);checkoutActions(registerActions);student.registerActions(registerActions);shellActions(registerActions);overlayActions(registerActions);for(const event of ['click','submit','change','input'])document.addEventListener(event,delegate);window.addEventListener('hashchange',scheduleRender);unsubscribe=subscribe(scheduleRender);renderCurrent();stopSwitcher=mountSwitcher(document.getElementById('switcher-root')); }
+export function startRouter() { if(started)return;started=true;publicActions(registerActions);authActions(registerActions);checkoutActions(registerActions);student.registerActions(registerActions);guardian.registerActions(registerActions);shellActions(registerActions);overlayActions(registerActions);for(const event of ['click','submit','change','input'])document.addEventListener(event,delegate);window.addEventListener('hashchange',scheduleRender);unsubscribe=subscribe(scheduleRender);renderCurrent();stopSwitcher=mountSwitcher(document.getElementById('switcher-root')); }
 // Optional lifecycle hook for embedding the prototype in a test harness.
 export function stopRouter() { if(!started)return;started=false;cleanup();stopSwitcher();unsubscribe();disposeOverlays();for(const event of ['click','submit','change','input'])document.removeEventListener(event,delegate);window.removeEventListener('hashchange',scheduleRender);handlers.clear();lastHash=null; }

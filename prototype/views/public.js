@@ -130,15 +130,16 @@ const para = value => `<p class="muted leading-relaxed">${esc(value)}</p>`;
 const missing = () => pageHeader({title:t('notFound')}) + emptyState({title:label('missing'),description:label('missingBody'),action:{label:t('explore'),href:'#/explore'}});
 function url(ctx, changes={}, path=ctx.path) { const q=new URLSearchParams(ctx.query);for(const [k,v] of Object.entries(changes)) { if(v==null||v==='')q.delete(k);else q.set(k,v); }return '#'+path+(q.size?'?'+q:''); }
 function navTabs(ctx,items,active) { return tabs(items.map(id=>({id,label:label(id),href:url(ctx,{tab:id,page:null})})),active,{label:label('sections')}); }
-function cards(courses) { return courses.length?`<div class="grid-cards">${courses.map(c=>courseCard(c)).join('')}</div>`:emptyState({title:label('empty'),description:label('emptyBody'),action:{label:t('resetFilters'),action:'public.resetFilters'}}); }
+function cards(courses,cardOptions=null) { return courses.length?`<div class="grid-cards">${courses.map(c=>courseCard(c,cardOptions?.(c)??{})).join('')}</div>`:emptyState({title:label('empty'),description:label('emptyBody'),action:{label:t('resetFilters'),action:'public.resetFilters'}}); }
 function fields() {
  const f=select('catalog.facets'),opts=rows=>[{value:'',label:t('all')},...rows.map(x=>({value:x.id,label:L(x.name)}))];
  return [{name:'q',label:label('search')},...Object.entries({curriculum:f.curricula,year:f.years,grade:select('grades'),subject:select('subjects'),teacher:f.teachers,semester:f.semesters}).map(([name,rows])=>({name,label:label(name),type:'select',options:opts(rows)})),...Object.entries({language:['ar','en'],mode:f.modes,price:['free','paid'],availability:['preview','live']}).map(([name,values])=>({name,label:label(name),type:'select',options:[{value:'',label:t('all')},...values.map(value=>({value,label:label(value)}))]})),{name:'max',label:label('max'),type:'number',min:0,step:1000}];
 }
-// Shared catalog body (filters, count, cards, pagination); the student portal reuses it inside its shell.
-export function results(ctx, fixed={}) {
+// Shared catalog body (filters, count, cards, pagination); student and guardian portals reuse it inside their shell.
+// Optional cardOptions(course) supplies courseCard options, e.g. the guardian's buy-for-child CTA.
+export function results(ctx, fixed={}, cardOptions=null) {
  const values={...Object.fromEntries(ctx.query),...fixed},rows=select('catalog.search',values),page=Math.max(1,Math.min(Math.ceil(rows.length/6)||1,Number.parseInt(ctx.query.get('page'),10)||1));
- return `<div class="catalog-layout"><aside class="min-w-0">${filterBar(fields().filter(f=>!Object.hasOwn(fixed,f.name)),values)}</aside><section class="min-w-0 stack">${para(t('results',{count:rows.length}))}${cards(rows.slice((page-1)*6,page*6))}${pagination({page,total:rows.length,pageSize:6})}</section></div>`;
+ return `<div class="catalog-layout"><aside class="min-w-0">${filterBar(fields().filter(f=>!Object.hasOwn(fixed,f.name)),values)}</aside><section class="min-w-0 stack">${para(t('results',{count:rows.length}))}${cards(rows.slice((page-1)*6,page*6),cardOptions)}${pagination({page,total:rows.length,pageSize:6})}</section></div>`;
 }
 export const explore={render(ctx) {
  const active=ctx.query.get('tab')||'grades',rows=select('catalog.search',Object.fromEntries(ctx.query));
