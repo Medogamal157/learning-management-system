@@ -382,3 +382,286 @@ registerSelectors({
   return {event_id:'DEMO-CHECKOUT-'+nextId(s.provider_events,'PE'),payment_transaction_id:d.transaction.id,payload:{order_id:d.order.id,beneficiary_ids:d.items.map(i=>i.beneficiary_student_id),amount_baisa:d.order.total_baisa,currency:d.order.currency,outcome:a.outcome}};
  }
 });
+
+// ---- P4 student learning. The acting student always comes from the persona, never from payload IDs;
+// course content requires an active grant (valid window + active enrollment), checked on read and write.
+const DAY=86400000;
+const REPORT_REASONS={unsafe:{ar:'محتوى غير آمن',en:'Unsafe content'},inappropriate:{ar:'لغة غير لائقة',en:'Inappropriate language'},privacy:{ar:'مشاركة معلومات خاصة',en:'Private information shared'},other:{ar:'سبب آخر',en:'Other reason'}};
+export const STUDENT_PREFS=['in_app','email_digest','live_reminders','qa_replies','results'];
+const SUBMISSION_FILE=/^[\w؀-ۿ][\w؀-ۿ .()-]{0,75}\.(txt|pdf|docx?|png|jpe?g)$/i;
+const JOINABLE=['scheduled','rescheduled','live'];
+const studentOf=(s,actor)=>s.preferences.role==='student'?s.students.find(x=>x.id===actor.record_id)??null:null;
+const lessonsIn=(s,courseId)=>s.modules.filter(m=>m.course_id===courseId).sort(byPosition).flatMap(m=>s.lessons.filter(l=>l.module_id===m.id&&l.state==='published').sort(byPosition));
+const lessonCourse=(s,lesson)=>s.modules.find(m=>m.id===lesson?.module_id)?.course_id??null;
+const ownProgress=(s,sid,courseId)=>{const ids=new Set(lessonsIn(s,courseId).map(l=>l.id));return s.lesson_progress.filter(p=>p.student_id===sid&&ids.has(p.lesson_id));};
+const percentOf=(done,total)=>total?Math.round(done*100/total):0;
+const userName=(s,id)=>s.users.find(u=>u.id===id)?.name??null;
+function accessOf(s,sid,courseId) {
+ const active=activeGrantIn(s,sid,courseId);if(active)return {state:'active',grant:active};
+ const last=s.access_grants.filter(g=>g.student_id===sid&&g.course_id===courseId).sort((a,b)=>a.ends_at.localeCompare(b.ends_at)||a.updated_at.localeCompare(b.updated_at)).at(-1);
+ if(!last)return {state:'none',grant:null};
+ const suspended=s.enrollments.find(e=>e.id===last.enrollment_id)?.status!=='active';
+ return {state:last.status==='revoked'||suspended?'revoked':'expired',grant:last};
+}
+// Students only see the live states that concern them; unpublished recording pipeline states read as ended.
+const studentLiveStatus=status=>['recording_processing','recording_ready'].includes(status)?'ended':status;
+function courseRow(s,sid,courseId) {
+ const c=s.courses.find(x=>x.id===courseId);if(!c)return null;
+ const lessons=lessonsIn(s,courseId),progress=ownProgress(s,sid,courseId),done=progress.filter(p=>p.status==='done').length,access=accessOf(s,sid,courseId);
+ const next=lessons.find(l=>progress.find(p=>p.lesson_id===l.id)?.status!=='done')??null,percent=percentOf(done,lessons.length);
+ return {course:publicView(c),status:c.status,access,done,total:lessons.length,percent,next,purchasable:isPublic(s,c),
+  enrollment:s.enrollments.find(e=>e.student_id===sid&&e.course_id===courseId)??null,
+  last_activity:progress.map(p=>p.updated_at).sort().at(-1)??null,
+  tab:access.state!=='active'?'expired':percent===100?'completed':'active'};
+}
+function studentCourses(s,sid) { return [...new Set([...s.enrollments,...s.access_grants].filter(r=>r.student_id===sid).map(r=>r.course_id))].map(id=>courseRow(s,sid,id)).filter(Boolean); }
+const activeCourseIds=(s,sid)=>new Set(studentCourses(s,sid).filter(r=>r.access.state==='active').map(r=>r.course.id));
+function quizView(s,sid,q) {
+ const attempts=s.attempts.filter(a=>a.quiz_id===q.id&&a.student_id===sid).sort((a,b)=>a.submitted_at.localeCompare(b.submitted_at)||a.id.localeCompare(b.id));
+ // Correct answers stay in the store; the learner sees them only through their own submitted snapshot.
+ const questions=q.question_ids.map(id=>s.questions.find(x=>x.id===id)).filter(Boolean).map(({correct_choice_id,...x})=>x);
+ const best=attempts.length?Math.max(...attempts.map(a=>a.score)):null;
+ return {...q,kind:'quiz',questions,attempts,best,last:attempts.at(-1)??null,remaining:Math.max(0,q.attempt_limit-attempts.length),passed:best!==null&&best>=q.pass_score};
+}
+function assignmentView(s,sid,a) {
+ const submission=s.submissions.find(x=>x.assignment_id===a.id&&x.student_id===sid)??null;
+ const grade=submission&&s.assessment_grades.find(g=>g.submission_id===submission.id&&g.released_at&&g.released_at<=DEMO_NOW);
+ // Graded-but-unreleased work still reads as submitted to the learner.
+ const state=!submission?'not_submitted':grade?'released':'submitted';
+ return {...a,kind:'assignment',submission,state,grade:grade?{score:grade.score,feedback:grade.feedback,released_at:grade.released_at}:null,late:!submission&&a.due_at<DEMO_NOW,late_submission:!!submission&&submission.submitted_at>a.due_at};
+}
+function studentWork(s,sid) {
+ const ids=activeCourseIds(s,sid),published=id=>s.lessons.find(l=>l.id===id)?.state==='published',title=id=>publicView(s.courses.find(c=>c.id===id)).title;
+ const assignments=s.assignments.filter(a=>ids.has(a.course_id)&&published(a.lesson_id)).map(a=>({...assignmentView(s,sid,a),course_title:title(a.course_id)})).sort((a,b)=>a.due_at.localeCompare(b.due_at));
+ const quizzes=s.quizzes.filter(q=>ids.has(q.course_id)&&published(q.lesson_id)).map(q=>({...quizView(s,sid,q),course_title:title(q.course_id)}));
+ return {assignments,quizzes};
+}
+function sessionView(s,sid,x) { const attendance=s.attendance.find(a=>a.live_session_id===x.id&&a.student_id===sid)??null;return {...x,student_status:studentLiveStatus(x.status),attendance,joinable:JOINABLE.includes(x.status)&&x.ends_at>DEMO_NOW}; }
+function visibleMessages(s,conversationId,sid) {
+ const student=s.students.find(x=>x.id===sid);
+ return s.messages.filter(m=>m.conversation_id===conversationId&&!m.internal&&m.moderation_state!=='removed').sort((a,b)=>a.created_at.localeCompare(b.created_at)).map(m=>{
+  const mine=m.author_user_id===student?.user_id,learner=s.students.find(x=>x.user_id===m.author_user_id),teacher=s.teachers.find(x=>x.user_id===m.author_user_id);
+  // Other learners stay anonymous ("Classmate"); staff replies keep their attribution.
+  return {id:m.id,text:m.text,lang:m.lang,created_at:m.created_at,flagged:m.moderation_state==='flagged',own:mine,author_role:mine?'self':learner?'classmate':teacher?'teacher':s.teacher_team_members.some(x=>x.user_id===m.author_user_id)?'assistant':'staff',author_name:mine||learner?null:userName(s,m.author_user_id)};
+ });
+}
+function learningRoom(s,{courseId},{actor}) {
+ const st=studentOf(s,actor);if(!st)return {status:'denied'};
+ const c=s.courses.find(x=>x.id===courseId);if(!c)return {status:'missing'};
+ const access=accessOf(s,st.id,c.id);
+ // Without a grant: public courses show purchase recovery, own lapsed history shows its recovery, anything else is a scoped denial.
+ if(access.state!=='active')return access.state==='none'&&!isPublic(s,c)?{status:'denied'}:{status:'locked',course:publicView(c),access,purchasable:isPublic(s,c)};
+ const progress=new Map(ownProgress(s,st.id,c.id).map(p=>[p.lesson_id,p]));
+ const modules=s.modules.filter(m=>m.course_id===c.id).sort(byPosition).map(m=>({id:m.id,title:m.title,position:m.position,lessons:s.lessons.filter(l=>l.module_id===m.id&&l.state==='published').sort(byPosition).map(l=>({...l,progress:progress.get(l.id)??null,status:progress.get(l.id)?.status??'not_started'}))}));
+ const lessons=modules.flatMap(m=>m.lessons),lessonIds=new Set(lessons.map(l=>l.id)),done=lessons.filter(l=>l.status==='done').length;
+ const conversations=s.conversations.filter(q=>q.course_id===c.id&&(q.student_id===st.id||q.kind==='lesson_qa')).sort((a,b)=>b.last_message_at.localeCompare(a.last_message_at)).map(q=>({...q,own:q.student_id===st.id,lesson:lessons.find(l=>l.id===q.lesson_id)??null,messages:visibleMessages(s,q.id,st.id)}));
+ return {status:'ok',student:st,course:publicView(c),archived:c.status!=='Published',access,enrollment:s.enrollments.find(e=>e.id===access.grant.enrollment_id),
+  modules,lessons,done,total:lessons.length,percent:percentOf(done,lessons.length),next:lessons.find(l=>l.status!=='done')??null,
+  teacher:s.teachers.find(x=>x.id===c.owner_teacher_id),
+  resources:s.lesson_resources.filter(r=>lessonIds.has(r.lesson_id)).map(r=>({...r,lesson:lessons.find(l=>l.id===r.lesson_id)})),
+  quizzes:s.quizzes.filter(q=>q.course_id===c.id&&lessonIds.has(q.lesson_id)).map(q=>quizView(s,st.id,q)),
+  assignments:s.assignments.filter(a=>a.course_id===c.id&&lessonIds.has(a.lesson_id)).map(a=>assignmentView(s,st.id,a)),
+  sessions:s.live_sessions.filter(x=>x.course_id===c.id&&x.status!=='draft').sort((a,b)=>a.starts_at.localeCompare(b.starts_at)).map(x=>sessionView(s,st.id,x)),
+  recordings:s.recordings.filter(r=>r.course_id===c.id&&r.state==='published'),
+  conversations,reported:new Set(s.safety_reports.filter(r=>r.reporter_user_id===st.user_id).map(r=>r.message_id)),
+  announcements:s.announcements.filter(a=>a.course_id===c.id&&a.published_at<=DEMO_NOW).sort((a,b)=>b.published_at.localeCompare(a.published_at)).map(a=>({...a,author:s.users.find(u=>u.id===a.author_user_id)??null}))};
+}
+function dashboard(s,_a,{actor}) {
+ const st=studentOf(s,actor);if(!st)return null;
+ const rows=studentCourses(s,st.id),active=rows.filter(r=>r.access.state==='active'),ids=new Set(active.map(r=>r.course.id));
+ const current=s.lesson_progress.filter(p=>p.student_id===st.id&&p.status==='in_progress').map(p=>({progress:p,lesson:s.lessons.find(l=>l.id===p.lesson_id)})).filter(x=>x.lesson?.state==='published'&&ids.has(lessonCourse(s,x.lesson))).sort((a,b)=>b.progress.updated_at.localeCompare(a.progress.updated_at))[0];
+ const resume=current?{lesson:current.lesson,progress:current.progress,row:active.find(r=>r.course.id===lessonCourse(s,current.lesson))}:active.filter(r=>r.next).map(r=>({lesson:r.next,progress:null,row:r}))[0]??null;
+ // Four weekly buckets ending at the demo clock, counted from the learner's own records.
+ const now=Date.parse(DEMO_NOW),events=[
+  ...s.lesson_progress.filter(p=>p.student_id===st.id&&p.status==='done').map(p=>['lessons',p.completed_at]),
+  ...s.attempts.filter(a=>a.student_id===st.id).map(a=>['assessments',a.submitted_at]),
+  ...s.submissions.filter(x=>x.student_id===st.id).map(x=>['assessments',x.submitted_at]),
+  ...s.attendance.filter(a=>a.student_id===st.id&&a.status==='present').map(a=>['live',a.joined_at])];
+ const weeks=[3,2,1,0].map(i=>{const end=now-i*7*DAY,start=end-7*DAY,hit=events.filter(([,at])=>{const time=Date.parse(at);return time>start&&time<=end;});return {start:new Date(start+DAY).toISOString(),end:new Date(end).toISOString(),lessons:hit.filter(e=>e[0]==='lessons').length,assessments:hit.filter(e=>e[0]==='assessments').length,live:hit.filter(e=>e[0]==='live').length};});
+ const work=studentWork(s,st.id);
+ const due=[...work.assignments.filter(a=>a.state==='not_submitted').map(a=>({...a,sort:a.due_at})),...work.quizzes.filter(q=>!q.attempts.length).map(q=>({...q,sort:'9999'}))].sort((a,b)=>a.sort.localeCompare(b.sort));
+ const sessions=s.live_sessions.filter(x=>ids.has(x.course_id)).map(x=>sessionView(s,st.id,x)).filter(x=>x.joinable).sort((a,b)=>a.starts_at.localeCompare(b.starts_at));
+ const notifications=s.notifications.filter(n=>n.recipient_user_id===st.user_id).sort((a,b)=>b.created_at.localeCompare(a.created_at));
+ return {student:st,grade:s.grades.find(g=>g.id===st.current_grade_id),active,resume,weeks,due,next_live:sessions[0]?{...sessions[0],course:publicView(s.courses.find(c=>c.id===sessions[0].course_id))}:null,
+  unread:notifications.filter(n=>!n.read_at),recommended:catalogSearch({grade:st.current_grade_id}).filter(c=>!ids.has(c.id)).slice(0,4),
+  totals:{courses:active.length,lessons:events.filter(e=>e[0]==='lessons').length,completed:rows.filter(r=>r.tab==='completed').length}};
+}
+function calendar(s,_a,{actor}) {
+ const st=studentOf(s,actor);if(!st)return null;const ids=activeCourseIds(s,st.id),title=id=>publicView(s.courses.find(c=>c.id===id)).title;
+ return {sessions:s.live_sessions.filter(x=>ids.has(x.course_id)&&x.status!=='draft').map(x=>({...sessionView(s,st.id,x),course_title:title(x.course_id)})).sort((a,b)=>a.starts_at.localeCompare(b.starts_at)),
+  deadlines:studentWork(s,st.id).assignments.map(a=>({id:a.id,course_id:a.course_id,title:a.title,course_title:a.course_title,due_at:a.due_at,state:a.state,late:a.late}))};
+}
+function ownConversation(s,id,st) { const q=s.conversations.find(x=>x.id===id);return q&&q.student_id===st.id&&activeGrantIn(s,st.id,q.course_id)?q:null; }
+function conversationList(s,_a,{actor}) {
+ const st=studentOf(s,actor);if(!st)return [];
+ return s.conversations.filter(q=>ownConversation(s,q.id,st)).sort((a,b)=>b.last_message_at.localeCompare(a.last_message_at)).map(q=>{const messages=visibleMessages(s,q.id,st.id);return {...q,course_title:publicView(s.courses.find(c=>c.id===q.course_id)).title,count:messages.length,last:messages.at(-1)??null};});
+}
+function thread(s,{id},{actor}) {
+ const st=studentOf(s,actor);if(!st)return {status:'denied'};const q=s.conversations.find(x=>x.id===id);if(!q)return {status:'missing'};
+ if(!ownConversation(s,id,st))return {status:'denied'};
+ return {status:'ok',conversation:q,course:publicView(s.courses.find(c=>c.id===q.course_id)),lesson:s.lessons.find(l=>l.id===q.lesson_id)??null,messages:visibleMessages(s,q.id,st.id),reported:new Set(s.safety_reports.filter(r=>r.reporter_user_id===st.user_id).map(r=>r.message_id))};
+}
+function profile(s,_a,{actor}) {
+ const st=studentOf(s,actor);if(!st)return null;const rows=studentCourses(s,st.id);
+ return {student:st,user:s.users.find(u=>u.id===st.user_id),grade:s.grades.find(g=>g.id===st.current_grade_id),interests:st.interests.map(id=>s.subjects.find(x=>x.id===id)).filter(Boolean),
+  history:rows.map(r=>({...r,historical_grade:s.grades.find(g=>g.id===r.enrollment?.historical_grade_id)??null})).sort((a,b)=>(b.enrollment?.started_at??'').localeCompare(a.enrollment?.started_at??'')),
+  stats:{active:rows.filter(r=>r.access.state==='active').length,completed:rows.filter(r=>r.tab==='completed').length,lessons:s.lesson_progress.filter(p=>p.student_id===st.id&&p.status==='done').length,quizzes:s.attempts.filter(a=>a.student_id===st.id).length,submissions:s.submissions.filter(x=>x.student_id===st.id).length,live:s.attendance.filter(a=>a.student_id===st.id&&a.status==='present').length}};
+}
+function settings(s,_a,{actor}) {
+ const st=studentOf(s,actor);if(!st)return null;
+ return {student:st,user:s.users.find(u=>u.id===st.user_id),prefs:Object.fromEntries(STUDENT_PREFS.map(k=>[k,st.notification_prefs?.[k]??true])),
+  guardians:s.guardian_student_links.filter(l=>l.student_id===st.id&&l.state==='verified').map(l=>({id:l.id,relationship:l.relationship,scopes:l.scopes,verified_at:l.verified_at,guardian:s.guardians.find(g=>g.id===l.guardian_id)}))};
+}
+function resourceFor(s,{id},{actor}) { const st=studentOf(s,actor),r=s.lesson_resources.find(x=>x.id===id),lesson=s.lessons.find(l=>l.id===r?.lesson_id);return st&&lesson?.state==='published'&&activeGrantIn(s,st.id,lessonCourse(s,lesson))?r:null; }
+registerSelectors({
+ 'student.courses':(s,_a,{actor})=>{const st=studentOf(s,actor);return st?studentCourses(s,st.id):[];},
+ 'student.room':learningRoom,'student.dashboard':dashboard,'student.calendar':calendar,
+ 'student.work':(s,_a,{actor})=>{const st=studentOf(s,actor);return st?studentWork(s,st.id):{assignments:[],quizzes:[]};},
+ 'student.conversations':conversationList,'student.thread':thread,'student.profile':profile,'student.settings':settings,'student.resource':resourceFor,
+ 'student.entitledCourses':(s,_a,{actor})=>{const st=studentOf(s,actor);return st?studentCourses(s,st.id).filter(r=>r.access.state==='active').map(r=>r.course):[];},
+});
+// Shared reducer guard: acting student + existing course + active grant.
+function learner(s,actor,courseId) {
+ const student=studentOf(s,actor);if(!student)return {error:'p4.studentOnly'};
+ if(!s.courses.some(c=>c.id===courseId))return {error:'missing'};
+ const grant=activeGrantIn(s,student.id,courseId);return grant?{student,grant}:{error:'p4.noAccess'};
+}
+function lessonGuard(s,actor,lessonId) {
+ const lesson=s.lessons.find(l=>l.id===lessonId&&l.state==='published');if(!lesson)return {error:'missing'};
+ const g=learner(s,actor,lessonCourse(s,lesson));return g.error?g:{...g,lesson};
+}
+function progressRecord(s,g,lesson,basis) {
+ let p=s.lesson_progress.find(x=>x.student_id===g.student.id&&x.lesson_id===lesson.id);
+ if(!p){p={id:nextId(s.lesson_progress,'LP'),enrollment_id:g.grant.enrollment_id,student_id:g.student.id,lesson_id:lesson.id,status:'in_progress',position_seconds:0,completion_basis:basis,completed_at:null,created_at:DEMO_NOW,updated_at:DEMO_NOW};s.lesson_progress.push(p);}
+ return p;
+}
+function complete(p,basis) { if(p.status==='done')return false;Object.assign(p,{status:'done',completion_basis:basis,completed_at:DEMO_NOW,updated_at:DEMO_NOW});return true; }
+function notifyUser(s,recipient,{event,type,title,body,href,courseId}) {
+ if(!recipient||s.notifications.some(n=>n.recipient_user_id===recipient&&n.event_id===event))return;
+ const n={id:nextId(s.notifications,'N'),recipient_user_id:recipient,event_id:event,type,title,body,href,read_at:null,related_course_id:courseId,created_at:DEMO_NOW,updated_at:DEMO_NOW};s.notifications.push(n);
+ s.delivery_attempts.push({id:nextId(s.delivery_attempts,'DA'),notification_id:n.id,channel:'in_app',state:'sent',attempts:1,last_error:null,created_at:DEMO_NOW,updated_at:DEMO_NOW});
+}
+const typed=v=>({ar:v,en:v});// Learner-authored text is stored as typed, never translated.
+Object.assign(reducers,{
+ // Reading lessons complete manually; video lessons through the explicit "Finish demo lesson" control.
+ // Quizzes and assignments complete only through their submit reducers.
+ 'student.completeLesson':(s,p,{actor})=>{
+  const g=lessonGuard(s,actor,p.lessonId);if(g.error)return fail(g.error);
+  if(!['reading','video'].includes(g.lesson.type))return fail('p4.completeBySubmit');
+  const basis=g.lesson.type==='reading'?'manual':'demo_finish',rec=progressRecord(s,g,g.lesson,basis);
+  if(g.lesson.type==='video')rec.position_seconds=g.lesson.duration_seconds;
+  return ok({lessonId:g.lesson.id,completed:complete(rec,basis)});
+ },
+ // Resume position for simulated video; reaching 90% of the duration completes the lesson.
+ 'student.savePosition':(s,p,{actor})=>{
+  const g=lessonGuard(s,actor,p.lessonId);if(g.error)return fail(g.error);
+  if(g.lesson.type!=='video')return fail('invalidAction');
+  const position=Math.round(Number(p.position));if(!Number.isFinite(position))return fail('invalidAction');
+  const rec=progressRecord(s,g,g.lesson,'video_90_percent');
+  rec.position_seconds=Math.min(g.lesson.duration_seconds,Math.max(0,position));rec.updated_at=DEMO_NOW;
+  const completed=rec.position_seconds>=g.lesson.duration_seconds*0.9&&complete(rec,'video_90_percent');
+  return ok({lessonId:g.lesson.id,position:rec.position_seconds,completed,done:rec.status==='done'});
+ },
+ 'quiz.submit':(s,p,{actor})=>{
+  const quiz=s.quizzes.find(q=>q.id===p.quizId);if(!quiz)return fail('missing');
+  const g=learner(s,actor,quiz.course_id);if(g.error)return fail(g.error);
+  const lesson=s.lessons.find(l=>l.id===quiz.lesson_id&&l.state==='published');if(!lesson)return fail('missing');
+  const attempts=s.attempts.filter(a=>a.quiz_id===quiz.id&&a.student_id===g.student.id);
+  if(attempts.length>=quiz.attempt_limit)return fail('p4.attemptLimit');
+  const questions=quiz.question_ids.map(id=>s.questions.find(q=>q.id===id)),answers={},errors={};
+  for(const q of questions){const v=p.answers?.[q.id];if(q.choices.some(c=>c.id===v))answers[q.id]=v;else errors[q.id]='p4.answerRequired';}
+  if(Object.keys(errors).length)return failFields(errors,'p4.answerAll');
+  const total=questions.reduce((n,q)=>n+q.points,0),earned=questions.reduce((n,q)=>n+(answers[q.id]===q.correct_choice_id?q.points:0),0),score=total?Math.round(earned*100/total):0;
+  const attempt={id:nextId(s.attempts,'ATTEMPT'),quiz_id:quiz.id,student_id:g.student.id,answers,question_snapshot:structuredClone(questions),score,submitted_at:DEMO_NOW,created_at:DEMO_NOW};
+  s.attempts.push(attempt);complete(progressRecord(s,g,lesson,'quiz_submit'),'quiz_submit');
+  return ok({attemptId:attempt.id,score,passed:score>=quiz.pass_score,remaining:quiz.attempt_limit-attempts.length-1});
+ },
+ 'assignment.submit':(s,p,{actor})=>{
+  const a=s.assignments.find(x=>x.id===p.assignmentId);if(!a)return fail('missing');
+  const g=learner(s,actor,a.course_id);if(g.error)return fail(g.error);
+  const lesson=s.lessons.find(l=>l.id===a.lesson_id&&l.state==='published');if(!lesson)return fail('missing');
+  if(s.submissions.some(x=>x.assignment_id===a.id&&x.student_id===g.student.id))return fail('p4.alreadySubmitted');
+  const body=text(p.text,4000),filename=text(p.filename,120).split(/[\\/]/).pop();
+  const errors=pick({text:body&&body.length<10?'error.messageShort':lengthError(body,10),filename:filename&&!SUBMISSION_FILE.test(filename)?'p4.filename':null});
+  if(Object.keys(errors).length)return failFields(errors);
+  const sub={id:nextId(s.submissions,'SUB'),assignment_id:a.id,student_id:g.student.id,text:body,filename:filename||null,state:'submitted',submitted_at:DEMO_NOW,created_at:DEMO_NOW,updated_at:DEMO_NOW};
+  s.submissions.push(sub);complete(progressRecord(s,g,lesson,'assignment_submit'),'assignment_submit');
+  return ok({submissionId:sub.id});
+ },
+ // Demo join: verifies the grant and session state, then records attendance once.
+ 'live.join':(s,p,{actor})=>{
+  const x=s.live_sessions.find(v=>v.id===p.sessionId&&v.status!=='draft');if(!x)return fail('missing');
+  const g=learner(s,actor,x.course_id);if(g.error)return fail(g.error);
+  if(x.status==='cancelled')return fail('p4.joinCancelled');
+  if(x.status==='failed')return fail('p4.joinFailed');
+  if(!JOINABLE.includes(x.status)||x.ends_at<=DEMO_NOW)return fail('p4.joinClosed');
+  const existing=s.attendance.find(a=>a.live_session_id===x.id&&a.student_id===g.student.id);
+  if(existing?.status==='present')return ok({attendanceId:existing.id,existing:true});
+  if(existing){Object.assign(existing,{status:'present',joined_at:DEMO_NOW,updated_at:DEMO_NOW});return ok({attendanceId:existing.id,existing:false});}
+  const att={id:nextId(s.attendance,'ATT'),live_session_id:x.id,student_id:g.student.id,joined_at:DEMO_NOW,left_at:null,minutes:0,status:'present',created_at:DEMO_NOW,updated_at:DEMO_NOW};
+  s.attendance.push(att);return ok({attendanceId:att.id,existing:false});
+ },
+ // New course question: a lesson_qa conversation in the owning course scope; only the course owner is notified.
+ 'qa.ask':(s,p,{actor})=>{
+  const g=learner(s,actor,p.courseId);if(g.error)return fail(g.error);
+  const subject=text(p.subject,120),body=text(p.text,2000),lessonId=text(p.lessonId,12)||null;
+  const errors=pick({subject:lengthError(subject,3),text:body&&body.length<10?'error.messageShort':lengthError(body,10),lessonId:lessonId&&!lessonsIn(s,p.courseId).some(l=>l.id===lessonId)?'p4.lessonInvalid':null});
+  if(Object.keys(errors).length)return failFields(errors);
+  const q={id:nextId(s.conversations,'Q'),course_id:p.courseId,lesson_id:lessonId,student_id:g.student.id,kind:'lesson_qa',subject:typed(subject),state:'open',assigned_user_id:null,last_message_at:DEMO_NOW,created_at:DEMO_NOW,updated_at:DEMO_NOW};
+  s.conversations.push(q);
+  s.messages.push({id:nextId(s.messages,'MSG'),conversation_id:q.id,author_user_id:g.student.user_id,text:body,lang:s.preferences.lang,internal:false,moderation_state:'visible',created_at:DEMO_NOW,updated_at:DEMO_NOW});
+  const course=s.courses.find(c=>c.id===p.courseId),owner=s.teachers.find(x=>x.id===course.owner_teacher_id);
+  notifyUser(s,owner?.account_status==='active'?owner.user_id:null,{event:'qa-'+q.id,type:'qa_question',title:{ar:'سؤال جديد في دورتك',en:'New question in your course'},body:typed(subject),href:'#/teacher/inbox/'+q.id,courseId:course.id});
+  return ok({conversationId:q.id});
+ },
+ 'message.reply':(s,p,{actor})=>{
+  const st=studentOf(s,actor);if(!st)return fail('p4.studentOnly');
+  const q=s.conversations.find(x=>x.id===p.conversationId);if(!q)return fail('missing');
+  if(!ownConversation(s,q.id,st))return fail('resourceDenied');
+  const body=text(p.text,2000),error=lengthError(body,2);if(error)return failFields({text:error});
+  s.messages.push({id:nextId(s.messages,'MSG'),conversation_id:q.id,author_user_id:st.user_id,text:body,lang:s.preferences.lang,internal:false,moderation_state:'visible',created_at:DEMO_NOW,updated_at:DEMO_NOW});
+  const reopened=q.state==='resolved';if(reopened)q.state='open';
+  Object.assign(q,{last_message_at:DEMO_NOW,updated_at:DEMO_NOW});return ok({conversationId:q.id,reopened});
+ },
+ 'message.resolve':(s,p,{actor})=>{
+  const st=studentOf(s,actor);if(!st)return fail('p4.studentOnly');
+  const q=s.conversations.find(x=>x.id===p.conversationId);if(!q)return fail('missing');
+  if(!ownConversation(s,q.id,st))return fail('resourceDenied');
+  if(q.state!=='resolved')Object.assign(q,{state:'resolved',updated_at:DEMO_NOW});return ok({conversationId:q.id});
+ },
+ // Reports go to the moderation safety queue once per reporter and message; internal notes are never reportable.
+ 'message.report':(s,p,{actor})=>{
+  const st=studentOf(s,actor);if(!st)return fail('p4.studentOnly');
+  const m=s.messages.find(x=>x.id===p.messageId&&!x.internal&&x.moderation_state!=='removed');if(!m)return fail('missing');
+  const q=s.conversations.find(x=>x.id===m.conversation_id);
+  if(!activeGrantIn(s,st.id,q.course_id)||(q.student_id!==st.id&&q.kind!=='lesson_qa'))return fail('resourceDenied');
+  if(m.author_user_id===st.user_id)return fail('p4.reportOwn');
+  if(!Object.hasOwn(REPORT_REASONS,p.reason))return failFields({reason:'p4.reasonRequired'});
+  const existing=s.safety_reports.find(r=>r.reporter_user_id===st.user_id&&r.message_id===m.id);
+  if(existing)return ok({reportId:existing.id,existing:true});
+  const report={id:nextId(s.safety_reports,'SR'),reporter_user_id:st.user_id,message_id:m.id,course_id:q.course_id,reason:structuredClone(REPORT_REASONS[p.reason]),state:'open',restricted_note:'',assigned_staff_id:null,created_at:DEMO_NOW,updated_at:DEMO_NOW};
+  s.safety_reports.push(report);if(m.moderation_state==='visible')Object.assign(m,{moderation_state:'flagged',updated_at:DEMO_NOW});
+  return ok({reportId:report.id,existing:false});
+ },
+ 'notifications.markRead':(s,p,{actor})=>{
+  const n=s.notifications.find(x=>x.id===p.id);if(!n)return fail('missing');
+  if(!actor.user_id||n.recipient_user_id!==actor.user_id)return fail('resourceDenied');
+  if(!n.read_at)Object.assign(n,{read_at:DEMO_NOW,updated_at:DEMO_NOW});return ok({id:n.id});
+ },
+ 'notifications.markAllRead':(s,_p,{actor})=>{
+  if(!actor.user_id)return fail('resourceDenied');let count=0;
+  for(const n of s.notifications)if(n.recipient_user_id===actor.user_id&&!n.read_at){Object.assign(n,{read_at:DEMO_NOW,updated_at:DEMO_NOW});count++;}
+  return ok({count});
+ },
+ // Changing the current grade never touches historical enrollments or grants.
+ 'student.updateProfile':(s,p,{actor})=>{
+  const st=studentOf(s,actor);if(!st)return fail('p4.studentOnly');
+  const interests=[...new Set((Array.isArray(p.interests)?p.interests:[]).filter(id=>s.subjects.some(x=>x.id===id)))];
+  if(!s.grades.some(g=>g.id===p.gradeId))return failFields({gradeId:'error.grade'});
+  Object.assign(st,{current_grade_id:p.gradeId,interests,updated_at:DEMO_NOW});return ok({gradeId:p.gradeId});
+ },
+ 'student.updateSettings':(s,p,{actor})=>{
+  const st=studentOf(s,actor);if(!st)return fail('p4.studentOnly');
+  st.notification_prefs=Object.fromEntries(STUDENT_PREFS.map(k=>[k,p.prefs?.[k]===true||p.prefs?.[k]==='on']));st.updated_at=DEMO_NOW;return ok({...st.notification_prefs});
+ },
+});

@@ -1,6 +1,6 @@
 import { t, L, esc, money, dateTime } from '../core/i18n.js';
 import { select } from '../core/store.js';
-import { courseCard, teacherCard, button, avatar, badge, breadcrumb, emptyState, filterBar, formField, lessonRow, modal, notice, pageHeader, pagination, tabs, showToast } from '../core/ui.js';
+import { courseCard, teacherCard, button, avatar, badge, breadcrumb, emptyState, filterBar, formField, lessonRow, modal, notice, pageHeader, pagination, tabs, showToast, simulatedPlayer, togglePlayer, toggleCaptions, mountPlayer } from '../core/ui.js';
 import { icon } from '../core/icons.js';
 import { courseCover } from '../core/media.js';
 import { mountCharts } from '../core/charts.js';
@@ -117,8 +117,8 @@ export function registerActions(register) {
     resetFilters: (_e,_el,ctx)=>ctx.navigate('#'+ctx.path+(ctx.query.has('tab')?'?tab='+encodeURIComponent(ctx.query.get('tab')):'')),
     page: (_e,el,ctx)=>ctx.navigate(url(ctx,{page:el.dataset.page})),
     enroll: (_e,el,ctx)=>{const r=ctx.dispatch('enrollment.enrollFree',{courseId:el.dataset.id});showToast(r.ok?label('enrolled'):t(r.errorKey),{tone:r.ok?'success':'error'});},
-    play: (_e,el)=>{const p=el.closest('[data-player]');p.dataset.playing=p.dataset.playing==='true'?'false':'true';el.textContent=label(p.dataset.playing==='true'?'pause':'play');},
-    captions: (_e,el)=>{const c=el.closest('[data-player]').querySelector('[data-caption]');c.hidden=!c.hidden;el.setAttribute('aria-pressed',String(!c.hidden));},
+    play: (_e,el)=>togglePlayer(el),
+    captions: (_e,el)=>toggleCaptions(el),
     contact: (event,el,ctx)=>{if(event.type!=='submit')return;const values=Object.fromEntries(new FormData(el)),r=ctx.dispatch('support.createTicket',values);if(!r.ok)ctx.dispatch('form.save',{form:'contact',values,fieldErrors:r.fieldErrors});},
     // Only rendered when more than one curriculum is active (SPEC §5 `/`).
     curriculum: (event, element, ctx) => { if (event.type === 'change') ctx.navigate('#/explore?curriculum=' + encodeURIComponent(element.value)); },
@@ -135,7 +135,8 @@ function fields() {
  const f=select('catalog.facets'),opts=rows=>[{value:'',label:t('all')},...rows.map(x=>({value:x.id,label:L(x.name)}))];
  return [{name:'q',label:label('search')},...Object.entries({curriculum:f.curricula,year:f.years,grade:select('grades'),subject:select('subjects'),teacher:f.teachers,semester:f.semesters}).map(([name,rows])=>({name,label:label(name),type:'select',options:opts(rows)})),...Object.entries({language:['ar','en'],mode:f.modes,price:['free','paid'],availability:['preview','live']}).map(([name,values])=>({name,label:label(name),type:'select',options:[{value:'',label:t('all')},...values.map(value=>({value,label:label(value)}))]})),{name:'max',label:label('max'),type:'number',min:0,step:1000}];
 }
-function results(ctx, fixed={}) {
+// Shared catalog body (filters, count, cards, pagination); the student portal reuses it inside its shell.
+export function results(ctx, fixed={}) {
  const values={...Object.fromEntries(ctx.query),...fixed},rows=select('catalog.search',values),page=Math.max(1,Math.min(Math.ceil(rows.length/6)||1,Number.parseInt(ctx.query.get('page'),10)||1));
  return `<div class="catalog-layout"><aside class="min-w-0">${filterBar(fields().filter(f=>!Object.hasOwn(fixed,f.name)),values)}</aside><section class="min-w-0 stack">${para(t('results',{count:rows.length}))}${cards(rows.slice((page-1)*6,page*6))}${pagination({page,total:rows.length,pageSize:6})}</section></div>`;
 }
@@ -162,16 +163,12 @@ export const course={render(ctx) {
  if(active==='overview')body=para(L(c.description))+`<h2>${esc(label('prerequisites'))}</h2>`+para(L(c.prerequisites))+teacherCard(c.teacher);
  if(active==='outcomes')body=para(L(c.outcomes));
  if(active==='syllabus')body=outline(c,ctx);
- if(active==='preview')body=sample?.preview?`${notice({message:label('simulated')})}<div class="sample-player panel stack" data-player><div class="sample-stage"><span>${icon('play',{size:48})}</span><h2>${esc(L(sample.title))}</h2><p data-caption>${esc(L(sample.transcript)||L(sample.body))}</p></div><progress data-timeline max="100" value="0" class="w-full" aria-label="${esc(label('timeline'))}"></progress><div class="flex-row">${button({label:label('play'),action:'public.play'})}${button({label:label('captions'),action:'public.captions',variant:'secondary'})}<output data-elapsed>0%</output></div><details><summary>${esc(label('transcript'))}</summary>${para(L(sample.transcript)||L(sample.body))}</details></div>${outline(c,ctx)}`:notice({message:label('lockedBody')})+outline(c,ctx);
+ if(active==='preview')body=sample?.preview?`${notice({message:label('simulated')})}${simulatedPlayer({title:L(sample.title),caption:L(sample.transcript)||L(sample.body),transcript:L(sample.transcript)||L(sample.body)})}${outline(c,ctx)}`:notice({message:label('lockedBody')})+outline(c,ctx);
  if(active==='schedule')body=para(label(c.mode))+para(t('footer.demoDate'))+(c.live_sessions.length?c.live_sessions.map(s=>`<article class="panel"><h2>${esc(L(s.title))}</h2>${badge(s.status,{domain:'live'})}<p><bdi>${esc(dateTime(s.starts_at))} — ${esc(dateTime(s.ends_at))}</bdi></p></article>`).join(''):notice({message:label('noLive')}));
  if(active==='access')body=notice({message:label('accessBody')})+para(dateTime(c.access_policy.end_at))+button({label:t('refunds'),href:'#/legal/refunds',variant:'secondary'});
  if(active==='reviews')body=notice({message:label('reviewsBody')});
  return `<div class="course-hero panel"><div><p class="eyebrow">${esc(L(c.grade.name))} · ${esc(L(c.subject.name))}</p>${pageHeader({title:L(c.title),subtitle:L(c.summary)})}<a class="flex-row" href="#/teacher/${esc(c.teacher.id)}">${avatar(c.teacher)}${esc(L(c.teacher.name))}</a><div class="flex-row mt-4"><span class="chip">${esc(label(c.mode))}</span><span class="chip">${esc(t('duration',{count:Math.round(lessons.reduce((n,l)=>n+l.duration_seconds,0)/60)}))}</span></div></div><img class="cover rounded-xl" src="${courseCover(c.id,c.subject.id)}" alt=""></div><div class="course-layout"><section class="min-w-0">${navTabs(ctx,['overview','outcomes','syllabus','preview','schedule','access','reviews'],active)}<div class="stack panel">${body}</div></section><aside class="panel purchase-card stack"><p class="text-3xl font-bold"><bdi>${esc(c.price_type==='free'?t('free'):money(c.price_baisa))}</bdi></p>${purchase(c,ctx)}${para(label('accessBody'))}<p><bdi>${esc(dateTime(c.access_policy.end_at))}</bdi></p>${viewer.lapsed?notice({message:label('lapsed')}):''}${button({label:t('refunds'),href:'#/legal/refunds',variant:'ghost'})}</aside></div><div class="mobile-purchase"><bdi>${esc(c.price_type==='free'?t('free'):money(c.price_baisa))}</bdi>${purchase(c,ctx)}</div>`;
-},mount(root) {
- const player=root.querySelector('[data-player]');if(!player)return ()=>{};let position=0;
- const timer=setInterval(()=>{if(player.dataset.playing!=='true')return;position=Math.min(100,position+1);player.querySelector('progress').value=position;player.querySelector('output').textContent=position+'%';if(position===100){player.dataset.playing='false';player.querySelector('[data-action="public.play"]').textContent=label('play');position=0;}},300);
- return ()=>clearInterval(timer);
-}};
+},mount(root) { return mountPlayer(root); }};
 export const teachers={render(ctx){const rows=select('teacherDirectory',Object.fromEntries(ctx.query));return pageHeader({title:t('teachers'),subtitle:label('teacherIntro')})+filterBar(fields().filter(f=>['grade','subject'].includes(f.name)),Object.fromEntries(ctx.query))+`<div class="grid-cards mt-6">${rows.map(x=>teacherCard(x)).join('')}</div>`+(rows.length?'':emptyState({title:label('empty')}));}};
 export const teacher={render(ctx){const x=select('teacher.public',{id:ctx.params.id});if(!x)return missing();const active=ctx.query.get('tab')||'about';return pageHeader({title:L(x.name),subtitle:label('teacherIntro')})+navTabs(ctx,['about','courses'],active)+(active==='about'?teacherCard(x)+`<div class="panel mt-6">${para(L(x.bio))}${x.credentials.map(c=>`<p>${esc(L(c.label))}</p>`).join('')}</div>`:cards(x.courses));}};
 export const become={render(){return pageHeader({title:t('become'),subtitle:label('becomeIntro')})+`<div class="grid-cards">${['benefits','process','checklist'].map(k=>`<section class="panel stack"><h2>${esc(label(k))}</h2>${para(label(k+'Body'))}</section>`).join('')}</div><div class="cta-band mt-8"><h2>${esc(label('applyTitle'))}</h2>${button({label:label('applyTitle'),href:'#/auth/teacher-application'})}</div>`;}};

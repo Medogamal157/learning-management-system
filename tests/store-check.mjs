@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { createSeed, PERSONAS, DEMO_NOW, ENUMS } from '../prototype/core/data.js';
 import { select, dispatch, can, getState, resetDemoData } from '../prototype/core/store.js';
-import { dictionary, money, t } from '../prototype/core/i18n.js';
+import { dictionary, money, t, L, esc } from '../prototype/core/i18n.js';
 import { routes } from '../prototype/core/router.js';
 
 let passed = 0;
@@ -604,5 +604,191 @@ for(const role of ['student','guardian'])for(const lang of ['ar','en']){
 dictionary.unknown=unknownEntry;
 resetDemoData();dispatch('preferences.set',{role:'visitor',lang:'ar'});
 console.log(`P3 render smoke: ${p3Renders} renders`);
+
+// ---------------------------------------------------------------- P4 student portal
+const p4Reset=()=>{resetDemoData();dispatch('preferences.set',{role:'student',lang:'ar'});};
+const progressOf=lessonId=>getState().lesson_progress.find(p=>p.student_id==='S-001'&&p.lesson_id===lessonId);
+const buyC001=()=>{const id=makeOrder('C-001','S-001').data.orderId;assert.ok(sendPayment(id,'success').ok);return id;};
+check('P4 viewing never completes; explicit actions do, idempotently',()=>{
+ p4Reset();const before=getState();
+ const room=routes.find(r=>r.path==='/student/course/:id');
+ for(const lesson of ['L-012','L-014','L-015'])room.view.render({params:{id:'C-002'},query:new URLSearchParams({tab:'lessons',lesson}),role:'student',actor:select('actor'),route:room,path:'/student/course/C-002',dispatch,navigate:()=>{}});
+ assert.equal(getState(),before,'render mutates nothing');assert.equal(progressOf('L-014'),undefined);assert.equal(progressOf('L-012').status,'in_progress');
+ assert.equal(select('student.room',{courseId:'C-002'}).percent,33);
+ const read=dispatch('student.completeLesson',{lessonId:'L-015'});assert.ok(read.ok&&read.data.completed);assert.equal(progressOf('L-015').completion_basis,'manual');
+ const count=getState().lesson_progress.length;assert.ok(dispatch('student.completeLesson',{lessonId:'L-015'}).ok);assert.equal(getState().lesson_progress.length,count);
+ assert.equal(dispatch('student.completeLesson',{lessonId:'L-017'}).errorKey,'p4.completeBySubmit');assert.equal(dispatch('student.completeLesson',{lessonId:'L-018'}).ok,false);
+ const finish=dispatch('student.completeLesson',{lessonId:'L-016'});assert.ok(finish.ok);assert.equal(progressOf('L-016').completion_basis,'demo_finish');
+ assert.equal(select('student.room',{courseId:'C-002'}).percent,56);
+ assert.equal(dispatch('student.completeLesson',{lessonId:'L-002'}).errorKey,'p4.noAccess','locked course');
+ assert.equal(dispatch('student.completeLesson',{lessonId:'L-020'}).errorKey,'missing','unpublished lesson');
+});
+check('P4 video 90% rule and resume position',()=>{
+ p4Reset();
+ const half=dispatch('student.savePosition',{lessonId:'L-014',position:200});assert.ok(half.ok);assert.equal(half.data.completed,false);assert.equal(progressOf('L-014').status,'in_progress');assert.equal(progressOf('L-014').position_seconds,200);
+ assert.equal(dispatch('student.savePosition',{lessonId:'L-014',position:377}).data.completed,false,'just under 90% of 420s');
+ const done=dispatch('student.savePosition',{lessonId:'L-014',position:378});assert.ok(done.data.completed);assert.equal(progressOf('L-014').status,'done');assert.equal(progressOf('L-014').completion_basis,'video_90_percent');
+ assert.equal(dispatch('student.savePosition',{lessonId:'L-014',position:10}).data.done,true,'rewinding keeps completion');
+ assert.equal(dispatch('student.savePosition',{lessonId:'L-014',position:99999}).data.position,420,'clamped to duration');
+ assert.equal(dispatch('student.savePosition',{lessonId:'L-015',position:10}).ok,false,'reading has no position');
+ assert.equal(dispatch('student.savePosition',{lessonId:'L-014',position:'abc'}).ok,false);
+});
+check('P4 quiz scoring, attempt limit 2 and retained snapshots',()=>{
+ p4Reset();assert.ok(dispatch('enrollment.enrollFree',{courseId:'C-005'}).ok);
+ const quiz=select('student.room',{courseId:'C-005'}).quizzes.find(q=>q.id==='QUIZ-004');
+ assert.ok(quiz.questions.every(q=>!('correct_choice_id' in q)),'answers hidden before submit');
+ const right=Object.fromEntries(getState().questions.filter(q=>q.quiz_id==='QUIZ-004').map(q=>[q.id,q.correct_choice_id]));
+ const wrong=Object.fromEntries(getState().questions.filter(q=>q.quiz_id==='QUIZ-004').map(q=>[q.id,q.choices.find(c=>c.id!==q.correct_choice_id).id]));
+ const partial=dispatch('quiz.submit',{quizId:'QUIZ-004',answers:{[Object.keys(right)[0]]:right[Object.keys(right)[0]]}});assert.equal(partial.ok,false);assert.equal(Object.keys(partial.fieldErrors).length,2);
+ assert.equal(progressOf('L-044'),undefined,'invalid submit does not complete');
+ const first=dispatch('quiz.submit',{quizId:'QUIZ-004',answers:wrong});assert.ok(first.ok);assert.equal(first.data.score,0);assert.equal(first.data.passed,false);assert.equal(first.data.remaining,1);
+ assert.equal(progressOf('L-044').status,'done');assert.equal(progressOf('L-044').completion_basis,'quiz_submit');
+ const second=dispatch('quiz.submit',{quizId:'QUIZ-004',answers:right});assert.equal(second.data.score,100);assert.ok(second.data.passed);
+ const before=getState();assert.equal(dispatch('quiz.submit',{quizId:'QUIZ-004',answers:right}).errorKey,'p4.attemptLimit');assert.equal(getState(),before);
+ const attempts=getState().attempts.filter(a=>a.quiz_id==='QUIZ-004'&&a.student_id==='S-001');assert.equal(attempts.length,2);
+ assert.ok(attempts.every(a=>a.question_snapshot.length===3&&a.question_snapshot.every(q=>q.correct_choice_id)));
+ const view=select('student.work').quizzes.find(q=>q.id==='QUIZ-004');assert.equal(view.best,100);assert.equal(view.remaining,0);
+ assert.equal(dispatch('quiz.submit',{quizId:'QUIZ-001',answers:{}}).errorKey,'p4.noAccess','quiz in a course without grant');
+});
+check('P4 assignment submission, validation and released-only grades',()=>{
+ p4Reset();assert.ok(dispatch('enrollment.enrollFree',{courseId:'C-005'}).ok);
+ assert.deepEqual(dispatch('assignment.submit',{assignmentId:'ASG-004',text:'short'}).fieldErrors,{text:'error.messageShort'});
+ assert.deepEqual(dispatch('assignment.submit',{assignmentId:'ASG-004',text:'My plant grew toward the window.',filename:'bad.exe'}).fieldErrors,{filename:'p4.filename'});
+ const r=dispatch('assignment.submit',{assignmentId:'ASG-004',text:'My plant grew toward the window.',filename:'C:\\fakepath\\plant notes.txt'});assert.ok(r.ok);
+ const sub=getState().submissions.find(x=>x.id===r.data.submissionId);assert.equal(sub.state,'submitted');assert.equal(sub.filename,'plant notes.txt');assert.equal(sub.student_id,'S-001');
+ assert.equal(progressOf('L-045').completion_basis,'assignment_submit');
+ assert.equal(dispatch('assignment.submit',{assignmentId:'ASG-004',text:'Another attempt at it.'}).errorKey,'p4.alreadySubmitted');
+ const work=select('student.work').assignments;assert.equal(work.find(a=>a.id==='ASG-004').grade,null);
+ assert.equal(work.find(a=>a.id==='ASG-002').grade.score,92,'released seed grade visible');
+ assert.equal(work.find(a=>a.id==='ASG-005').state,'submitted');assert.equal(dispatch('assignment.submit',{assignmentId:'ASG-001',text:'Not entitled yet.'}).errorKey,'p4.noAccess');
+});
+check('P4 scoped reads: locked, denied and other learners\' conversations',()=>{
+ p4Reset();
+ const locked=select('student.room',{courseId:'C-001'});assert.equal(locked.status,'locked');assert.equal(locked.lessons,undefined);assert.equal(locked.modules,undefined);
+ assert.equal(select('student.room',{courseId:'C-003'}).status,'denied');assert.equal(select('student.room',{courseId:'C-999'}).status,'missing');
+ assert.equal(select('student.room',{courseId:'C-011'}).access.state,'expired');
+ assert.equal(select('student.thread',{id:'Q-004'}).status,'denied');assert.equal(select('student.thread',{id:'Q-999'}).status,'missing');
+ assert.equal(select('student.thread',{id:'Q-001'}).status,'ok');
+ assert.equal(dispatch('message.reply',{conversationId:'Q-004',text:'Hello there'}).errorKey,'resourceDenied');
+ assert.equal(dispatch('message.resolve',{conversationId:'Q-006'}).errorKey,'resourceDenied');
+ assert.ok(select('student.conversations').every(q=>q.student_id==='S-001'));
+ const qa=select('student.room',{courseId:'C-002'}).conversations;assert.ok(!qa.some(q=>q.id==='Q-006'),'other learner private support hidden');
+ assert.equal(select('student.resource',{id:'RES-001'}),null,'C-001 worksheet locked');assert.ok(select('student.resource',{id:'RES-003'}));
+ for(const role of ['guardian','teacher','visitor']){dispatch('preferences.set',{role});assert.equal(select('student.room',{courseId:'C-002'}).status,'denied');assert.equal(dispatch('student.completeLesson',{lessonId:'L-011'}).ok,false);assert.equal(dispatch('live.join',{sessionId:'LS-004'}).ok,false);}
+});
+check('P4 purchase of C-001 unlocks the room; internal notes and classmate names stay hidden',()=>{
+ p4Reset();assert.equal(select('student.room',{courseId:'C-001'}).status,'locked');
+ assert.equal(dispatch('live.join',{sessionId:'LS-001'}).errorKey,'p4.noAccess','non-entitled join denied');
+ buyC001();const room=select('student.room',{courseId:'C-001'});assert.equal(room.status,'ok');assert.equal(room.access.grant.origin,'one_time_purchase');assert.equal(room.percent,0);
+ assert.ok(select('student.courses').some(r=>r.course.id==='C-001'&&r.tab==='active'));
+ const q4=room.conversations.find(q=>q.id==='Q-004');assert.ok(q4&&!q4.own);
+ assert.ok(!q4.messages.some(m=>m.id==='MSG-011'),'internal note hidden');assert.ok(q4.messages.filter(m=>m.author_role==='classmate').every(m=>m.author_name===null));
+ assert.ok(!room.conversations.some(q=>q.id==='Q-003'),'private support of another learner hidden');
+ assert.ok(dispatch('student.completeLesson',{lessonId:'L-002'}).ok);assert.equal(select('student.room',{courseId:'C-001'}).percent,11);
+});
+check('P4 live join: grant, state and attendance once',()=>{
+ p4Reset();buyC001();const n=getState().attendance.length;
+ const r=dispatch('live.join',{sessionId:'LS-001'});assert.ok(r.ok&&!r.data.existing);assert.equal(getState().attendance.length,n+1);
+ const att=getState().attendance.find(a=>a.id===r.data.attendanceId);assert.deepEqual([att.student_id,att.status,att.live_session_id],['S-001','present','LS-001']);
+ assert.ok(dispatch('live.join',{sessionId:'LS-001'}).data.existing);assert.equal(getState().attendance.length,n+1);
+ assert.ok(dispatch('live.join',{sessionId:'LS-005'}).ok,'live now');
+ assert.equal(dispatch('live.join',{sessionId:'LS-002'}).errorKey,'p4.joinClosed');assert.equal(dispatch('live.join',{sessionId:'LS-004'}).errorKey,'p4.joinClosed');
+ assert.equal(dispatch('live.join',{sessionId:'LS-008'}).errorKey,'p4.noAccess','cancelled session in a course without grant');
+ const rec=select('student.room',{courseId:'C-001'}).recordings;assert.deepEqual(rec.map(x=>x.id),['REC-001']);
+ assert.deepEqual(select('student.room',{courseId:'C-002'}).recordings,[],'ready/processing recordings hidden');
+});
+check('P4 Q&A, replies, reports and notification eligibility',()=>{
+ p4Reset();const notes=getState().notifications.length;
+ assert.equal(dispatch('qa.ask',{courseId:'C-001',subject:'Fractions',text:'How do fractions work?'}).errorKey,'p4.noAccess');
+ assert.ok(dispatch('qa.ask',{courseId:'C-002',subject:'x',text:'short'}).fieldErrors.subject);
+ assert.equal(dispatch('qa.ask',{courseId:'C-002',lessonId:'L-001',subject:'Plants',text:'Why are leaves green?'}).fieldErrors.lessonId,'p4.lessonInvalid');
+ const r=dispatch('qa.ask',{courseId:'C-002',lessonId:'L-011',subject:'<img src=x onerror=alert(1)>',text:'Why are leaves green in spring?'});assert.ok(r.ok);
+ const q=getState().conversations.find(x=>x.id===r.data.conversationId);assert.deepEqual([q.kind,q.state,q.student_id,q.course_id],['lesson_qa','open','S-001','C-002']);
+ const added=getState().notifications.slice(notes);assert.deepEqual(added.map(n=>n.recipient_user_id),['U-T001'],'only the course owner is notified');
+ assert.equal(select('student.thread',{id:q.id}).messages.length,1);
+ const html=routes.find(x=>x.path==='/student/messages/:id').view.render({params:{id:q.id},query:new URLSearchParams(),role:'student',actor:select('actor'),dispatch,navigate:()=>{}});
+ assert.ok(html.includes('&lt;img src=x onerror=alert(1)&gt;')&&!html.includes('<img src=x'));
+ assert.ok(dispatch('message.reply',{conversationId:'Q-010',text:'One more thank you!'}).data.reopened);assert.equal(getState().conversations.find(x=>x.id==='Q-010').state,'open');
+ assert.ok(dispatch('message.resolve',{conversationId:'Q-010'}).ok);assert.equal(getState().conversations.find(x=>x.id==='Q-010').state,'resolved');
+ const reports=getState().safety_reports.length;
+ assert.equal(dispatch('message.report',{messageId:'MSG-001',reason:'other'}).errorKey,'p4.reportOwn');
+ assert.ok(dispatch('message.report',{messageId:'MSG-002',reason:'x'}).fieldErrors.reason);
+ const rep=dispatch('message.report',{messageId:'MSG-002',reason:'unsafe'});assert.ok(rep.ok&&!rep.data.existing);
+ assert.ok(dispatch('message.report',{messageId:'MSG-002',reason:'other'}).data.existing);assert.equal(getState().safety_reports.length,reports+1);
+ const sr=getState().safety_reports.at(-1);assert.deepEqual([sr.reporter_user_id,sr.message_id,sr.course_id,sr.state],['U-S001','MSG-002','C-002','open']);
+ assert.equal(dispatch('message.report',{messageId:'MSG-011',reason:'unsafe'}).ok,false,'internal note never reportable');
+ assert.equal(dispatch('message.report',{messageId:'MSG-010',reason:'unsafe'}).errorKey,'resourceDenied','no grant for C-001');
+});
+check('P4 notifications are own-only; mark read and mark all read',()=>{
+ p4Reset();assert.equal(select('notifications.count'),2);
+ assert.ok(dispatch('notifications.markRead',{id:'N-001'}).ok);assert.equal(select('notifications.count'),1);
+ const guardianNote=getState().notifications.find(n=>n.recipient_user_id!=='U-S001');assert.equal(dispatch('notifications.markRead',{id:guardianNote.id}).errorKey,'resourceDenied');
+ assert.equal(dispatch('notifications.markAllRead',{}).data.count,1);assert.equal(select('notifications.count'),0);assert.equal(dispatch('notifications.markAllRead',{}).data.count,0);
+ assert.ok(getState().notifications.filter(n=>n.recipient_user_id!=='U-S001').some(n=>!n.read_at),'others untouched');
+});
+check('P4 profile grade change keeps enrollments and grants',()=>{
+ p4Reset();const enrollments=structuredClone(getState().enrollments),grants=structuredClone(getState().access_grants);
+ assert.ok(dispatch('student.updateProfile',{gradeId:'99'}).fieldErrors.gradeId);
+ assert.ok(dispatch('student.updateProfile',{gradeId:'5',interests:['science','bogus','science']}).ok);
+ assert.equal(getState().students.find(s=>s.id==='S-001').current_grade_id,'5');assert.deepEqual(getState().students.find(s=>s.id==='S-001').interests,['science']);
+ assert.deepEqual(getState().enrollments,enrollments);assert.deepEqual(getState().access_grants,grants);
+ assert.ok(select('student.dashboard').recommended.every(c=>c.grade.id==='5'));
+ assert.equal(select('student.profile').history.find(h=>h.course.id==='C-011').historical_grade.id,'3');
+ assert.ok(dispatch('student.updateSettings',{prefs:{in_app:true,email_digest:'on'}}).ok);assert.deepEqual(select('student.settings').prefs,{in_app:true,email_digest:true,live_reminders:false,qa_replies:false,results:false});
+ assert.deepEqual(select('student.settings').guardians.map(g=>g.guardian.id),['G-001','G-002']);
+});
+check('P4 dashboard counts derive from the store',()=>{
+ p4Reset();const d=select('student.dashboard');
+ assert.equal(d.totals.courses,select('student.courses').filter(r=>r.access.state==='active').length);
+ assert.equal(d.unread.length,select('notifications.count'));assert.equal(d.resume.lesson.id,'L-083');
+ const before=d.weeks.at(-1).lessons;assert.ok(dispatch('student.completeLesson',{lessonId:'L-015'}).ok);assert.equal(select('student.dashboard').weeks.at(-1).lessons,before+1);
+ assert.ok(dispatch('enrollment.enrollFree',{courseId:'C-005'}).ok);assert.deepEqual(select('student.dashboard').due.map(w=>w.id).sort(),['ASG-004','QUIZ-004']);
+});
+// Isolated fixtures for states the student cannot create: unreleased grades and cancelled/failed entitled sessions.
+{
+ const fixtureSource=storeSource.replace("'./data.js'",JSON.stringify(new URL('../prototype/core/data.js',import.meta.url).href)).replaceAll('...createSeed()','...fixtureSeed()')+`\nfunction fixtureSeed(){const s=createSeed();s.assessment_grades.push({id:'GRADE-900',submission_id:'SUB-006',grader_user_id:'U-T001',score:70,feedback:'x',released_at:null,created_at:'2026-10-14T09:00:00Z',updated_at:'2026-10-14T09:00:00Z'});const ls=id=>s.live_sessions.find(x=>x.id===id);Object.assign(ls('LS-003'),{status:'cancelled',starts_at:'2026-10-21T14:00:00Z',ends_at:'2026-10-21T15:00:00Z'});Object.assign(ls('LS-004'),{status:'failed',starts_at:'2026-10-22T14:00:00Z',ends_at:'2026-10-22T15:00:00Z'});return s;}`;
+ const iso=await import('data:text/javascript;base64,'+Buffer.from(fixtureSource).toString('base64'));
+ check('P4 unreleased grade hidden; cancelled/failed entitled sessions cannot be joined',()=>{
+  iso.dispatch('preferences.set',{role:'student'});
+  const asg=iso.select('student.work').assignments.find(a=>a.id==='ASG-005');assert.equal(asg.state,'submitted');assert.equal(asg.grade,null);
+  assert.ok(!JSON.stringify(iso.select('student.room',{courseId:'C-010'})).includes('GRADE-900'));
+  const before=iso.getState();
+  assert.equal(iso.dispatch('live.join',{sessionId:'LS-003'}).errorKey,'p4.joinCancelled');assert.equal(iso.dispatch('live.join',{sessionId:'LS-004'}).errorKey,'p4.joinFailed');
+  assert.equal(iso.getState(),before,'no attendance fabricated');
+  const sessions=iso.select('student.room',{courseId:'C-002'}).sessions;assert.ok(sessions.every(x=>!x.joinable));
+ });
+}
+let p4Renders=0;
+dictionary.unknown={ar:'MISSING_DICTIONARY_KEY',en:'MISSING_DICTIONARY_KEY'};
+const studentRoute=path=>routes.find(r=>r.path===path);
+const p4Render=(path,params={},query='')=>{const route=studentRoute(path),ctx={params,query:new URLSearchParams(query),role:'student',actor:select('actor'),route,path:path.replace(':id',params.id??''),dispatch,navigate:()=>{}};for(const [key,values] of Object.entries(route.queryValues))if(ctx.query.has(key)&&!values.includes(ctx.query.get(key)))ctx.query.set(key,values[0]);return {html:route.view.render(ctx),ctx};};
+for(const lang of ['ar','en']){
+ p4Reset();dispatch('preferences.set',{lang});
+ const cases=[['/student'],['/student/explore'],['/student/explore',{},'all=1'],['/student/explore',{},'grade=5&page=2'],['/student/calendar'],['/student/calendar',{},'week=-1'],['/student/calendar',{},'week=1'],['/student/calendar',{},'view=list'],['/student/notifications'],['/student/notifications',{},'filter=unread'],['/student/profile'],['/student/messages/:id',{id:'Q-001'}],['/student/messages/:id',{id:'Q-010'}],['/student/course/:id',{id:'C-002'},'tab=bogus']];
+ for(const path of ['/student/courses','/student/assignments','/student/messages','/student/settings'])for(const tab of studentRoute(path).queryValues.tab)cases.push([path,{},'tab='+tab]);
+ for(const tab of studentRoute('/student/course/:id').queryValues.tab)cases.push(['/student/course/:id',{id:'C-002'},'tab='+tab]);
+ for(const lesson of ['L-010','L-011','L-012','L-015','L-017','L-018','L-999'])cases.push(['/student/course/:id',{id:'C-002'},'tab=lessons&lesson='+lesson]);
+ for(const activity of ['QUIZ-002','ASG-002'])cases.push(['/student/course/:id',{id:'C-002'},'tab=assessments&activity='+activity]);
+ cases.push(['/student/course/:id',{id:'C-002'},'tab=assessments&activity=QUIZ-002&retry=1']);
+ const run=list=>{for(const [path,params={},query=''] of list)check(`P4 render ${lang} ${path} ${JSON.stringify(params)} ${query}`,()=>{
+  const before=getState(),{html}=p4Render(path,params,query);p4Renders++;assert.equal(getState(),before,'render is read-only');assert.ok(html.length>0);
+  assert.doesNotMatch(html,/undefined|NaN|\[object Object\]|MISSING_DICTIONARY_KEY/);assert.doesNotMatch(html.replace(/<[^>]+>/g,' '),/\b(?:p2|p3|p4|error|status|route)\.[\w./:-]+/);
+ });};
+ run(cases);
+ // Locked, lapsed, denied and missing learning rooms, plus a denied thread, never show protected content.
+ check(`P4 render ${lang} locked/denied states`,()=>{
+  const lockedHtml=p4Render('/student/course/:id',{id:'C-001'},'tab=lessons&lesson=L-002').html,body=L(getState().lessons.find(l=>l.id==='L-002').body);
+  assert.ok(!lockedHtml.includes(esc(body))&&lockedHtml.includes('#/course/C-001'));assert.ok(p4Render('/student/course/:id',{id:'C-011'}).html.includes('#/course/C-011'));
+  for(const [path,params,kind] of [['/student/course/:id',{id:'C-003'},'resourceDenied'],['/student/course/:id',{id:'C-999'},'missing'],['/student/messages/:id',{id:'Q-004'},'resourceDenied'],['/student/messages/:id',{id:'Q-999'},'missing']]){const {html,ctx}=p4Render(path,params);p4Renders++;assert.equal(html,fallback(kind,ctx));assert.doesNotMatch(html,/MISSING_DICTIONARY_KEY|undefined/);}
+ });
+ // After purchase, enrollment, join and submissions: every remaining branch renders.
+ buyC001();assert.ok(dispatch('enrollment.enrollFree',{courseId:'C-005'}).ok);assert.ok(dispatch('live.join',{sessionId:'LS-001'}).ok);
+ assert.ok(dispatch('quiz.submit',{quizId:'QUIZ-001',answers:Object.fromEntries(getState().questions.filter(q=>q.quiz_id==='QUIZ-001').map(q=>[q.id,q.correct_choice_id]))}).ok);
+ assert.ok(dispatch('qa.ask',{courseId:'C-001',subject:'Souq maths',text:'Why did we multiply here?'}).ok);
+ run([['/student'],['/student/calendar'],['/student/calendar',{},'week=1'],['/student/assignments',{},'tab=results'],['/student/course/:id',{id:'C-001'},'tab=live'],['/student/course/:id',{id:'C-001'},'tab=live&session=LS-001'],['/student/course/:id',{id:'C-001'},'tab=live&recording=REC-001'],['/student/course/:id',{id:'C-001'},'tab=qa'],['/student/course/:id',{id:'C-001'},'tab=assessments&activity=QUIZ-001'],['/student/course/:id',{id:'C-001'},'tab=assessments&activity=ASG-001'],['/student/course/:id',{id:'C-005'},'tab=assessments&activity=QUIZ-004'],['/student/course/:id',{id:'C-005'},'tab=assessments&activity=ASG-004'],['/student/course/:id',{id:'C-005'},'tab=resources'],['/student/course/:id',{id:'C-005'},'tab=overview'],['/student/messages',{},'tab=questions']]);
+}
+dictionary.unknown=unknownEntry;
+resetDemoData();dispatch('preferences.set',{role:'visitor',lang:'ar'});
+console.log(`P4 render smoke: ${p4Renders} renders`);
 
 console.log(`${passed} checks passed${process.exitCode ? ' (with failures above)' : ''}`);

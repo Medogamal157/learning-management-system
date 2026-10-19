@@ -1,5 +1,6 @@
 import { beneficiary, review, provider, result, receipt, registerActions as checkoutActions } from '../views/checkout.js';
 import { signIn, resetPassword, registration, teacherApplication, registerActions as authActions } from '../views/auth.js';
+import * as student from '../views/student.js';
 import { home, explore, grade, subject, course, teachers, teacher, become, about, help, legal, registerActions as publicActions } from '../views/public.js';
 import { getState, select, dispatch, subscribe } from './store.js';
 import { t, L, esc } from './i18n.js';
@@ -31,17 +32,17 @@ export const routes = [
 {"path": "/checkout/order/:orderId/provider", "roles": ["student", "guardian"], "title": {"ar": "الدفع التجريبي", "en": "Demo payment"}, "module": "checkout", "phase": 3, "titleKey": "route./checkout/order/:orderId/provider", "queryValues": {}, "view": provider},
 {"path": "/checkout/order/:orderId/result", "roles": ["student", "guardian"], "title": {"ar": "نتيجة الدفع", "en": "Payment result"}, "module": "checkout", "phase": 3, "titleKey": "route./checkout/order/:orderId/result", "queryValues": {}, "view": result},
 {"path": "/checkout/order/:orderId/receipt", "roles": ["student", "guardian"], "title": {"ar": "إيصال الطلب", "en": "Order receipt"}, "module": "checkout", "phase": 3, "titleKey": "route./checkout/order/:orderId/receipt", "queryValues": {}, "view": receipt},
-{"path": "/student", "roles": ["student"], "title": {"ar": "لوحة الطالب", "en": "Student dashboard"}, "module": "student", "phase": 4, "titleKey": "route./student", "queryValues": {}, "view": future},
-{"path": "/student/courses", "roles": ["student"], "title": {"ar": "دوراتي", "en": "My courses"}, "module": "student", "phase": 4, "titleKey": "route./student/courses", "queryValues": {"tab": ["active", "completed", "expired"]}, "view": future},
-{"path": "/student/course/:id", "roles": ["student"], "title": {"ar": "غرفة التعلم", "en": "Learning room"}, "module": "student", "phase": 4, "titleKey": "route./student/course/:id", "queryValues": {"tab": ["overview", "lessons", "resources", "assessments", "live", "qa", "announcements"]}, "view": future},
-{"path": "/student/explore", "roles": ["student"], "title": {"ar": "اكتشف دورات", "en": "Browse courses"}, "module": "student", "phase": 4, "titleKey": "route./student/explore", "queryValues": {}, "view": future},
-{"path": "/student/calendar", "roles": ["student"], "title": {"ar": "الجدول والحصص المباشرة", "en": "Calendar and live classes"}, "module": "student", "phase": 4, "titleKey": "route./student/calendar", "queryValues": {}, "view": future},
-{"path": "/student/assignments", "roles": ["student"], "title": {"ar": "الواجبات والنتائج", "en": "Assignments and results"}, "module": "student", "phase": 4, "titleKey": "route./student/assignments", "queryValues": {"tab": ["assignments", "quizzes", "results"]}, "view": future},
-{"path": "/student/messages", "roles": ["student"], "title": {"ar": "الرسائل والأسئلة", "en": "Messages and questions"}, "module": "student", "phase": 4, "titleKey": "route./student/messages", "queryValues": {"tab": ["conversations", "questions"]}, "view": future},
-{"path": "/student/messages/:id", "roles": ["student"], "title": {"ar": "المحادثة", "en": "Conversation"}, "module": "student", "phase": 4, "titleKey": "route./student/messages/:id", "queryValues": {}, "view": future},
-{"path": "/student/notifications", "roles": ["student"], "title": {"ar": "الإشعارات", "en": "Notifications"}, "module": "student", "phase": 4, "titleKey": "route./student/notifications", "queryValues": {}, "view": future},
-{"path": "/student/profile", "roles": ["student"], "title": {"ar": "الملف التعليمي", "en": "Learning profile"}, "module": "student", "phase": 4, "titleKey": "route./student/profile", "queryValues": {}, "view": future},
-{"path": "/student/settings", "roles": ["student"], "title": {"ar": "الحساب والخصوصية", "en": "Account and privacy"}, "module": "student", "phase": 4, "titleKey": "route./student/settings", "queryValues": {"tab": ["account", "privacy", "notifications"]}, "view": future},
+{"path": "/student", "roles": ["student"], "title": {"ar": "لوحة الطالب", "en": "Student dashboard"}, "module": "student", "phase": 4, "titleKey": "route./student", "queryValues": {}, "view": student.dashboard},
+{"path": "/student/courses", "roles": ["student"], "title": {"ar": "دوراتي", "en": "My courses"}, "module": "student", "phase": 4, "titleKey": "route./student/courses", "queryValues": {"tab": ["active", "completed", "expired"]}, "view": student.courses},
+{"path": "/student/course/:id", "roles": ["student"], "title": {"ar": "غرفة التعلم", "en": "Learning room"}, "module": "student", "phase": 4, "titleKey": "route./student/course/:id", "queryValues": {"tab": ["overview", "lessons", "resources", "assessments", "live", "qa", "announcements"]}, "view": student.room},
+{"path": "/student/explore", "roles": ["student"], "title": {"ar": "اكتشف دورات", "en": "Browse courses"}, "module": "student", "phase": 4, "titleKey": "route./student/explore", "queryValues": {}, "view": student.explore},
+{"path": "/student/calendar", "roles": ["student"], "title": {"ar": "الجدول والحصص المباشرة", "en": "Calendar and live classes"}, "module": "student", "phase": 4, "titleKey": "route./student/calendar", "queryValues": {}, "view": student.calendar},
+{"path": "/student/assignments", "roles": ["student"], "title": {"ar": "الواجبات والنتائج", "en": "Assignments and results"}, "module": "student", "phase": 4, "titleKey": "route./student/assignments", "queryValues": {"tab": ["assignments", "quizzes", "results"]}, "view": student.assignments},
+{"path": "/student/messages", "roles": ["student"], "title": {"ar": "الرسائل والأسئلة", "en": "Messages and questions"}, "module": "student", "phase": 4, "titleKey": "route./student/messages", "queryValues": {"tab": ["conversations", "questions"]}, "view": student.messages},
+{"path": "/student/messages/:id", "roles": ["student"], "title": {"ar": "المحادثة", "en": "Conversation"}, "module": "student", "phase": 4, "titleKey": "route./student/messages/:id", "queryValues": {}, "view": student.thread},
+{"path": "/student/notifications", "roles": ["student"], "title": {"ar": "الإشعارات", "en": "Notifications"}, "module": "student", "phase": 4, "titleKey": "route./student/notifications", "queryValues": {}, "view": student.notifications},
+{"path": "/student/profile", "roles": ["student"], "title": {"ar": "الملف التعليمي", "en": "Learning profile"}, "module": "student", "phase": 4, "titleKey": "route./student/profile", "queryValues": {}, "view": student.profile},
+{"path": "/student/settings", "roles": ["student"], "title": {"ar": "الحساب والخصوصية", "en": "Account and privacy"}, "module": "student", "phase": 4, "titleKey": "route./student/settings", "queryValues": {"tab": ["account", "privacy", "notifications"]}, "view": student.settings},
 {"path": "/guardian", "roles": ["guardian"], "title": {"ar": "لوحة ولي الأمر", "en": "Guardian dashboard"}, "module": "guardian", "phase": 5, "titleKey": "route./guardian", "queryValues": {}, "view": future},
 {"path": "/guardian/children", "roles": ["guardian"], "title": {"ar": "أبنائي", "en": "My children"}, "module": "guardian", "phase": 5, "titleKey": "route./guardian/children", "queryValues": {}, "view": future},
 {"path": "/guardian/children/link", "roles": ["guardian"], "title": {"ar": "ربط طالب والتحقق", "en": "Link and verify child"}, "module": "guardian", "phase": 5, "titleKey": "route./guardian/children/link", "queryValues": {}, "view": future},
@@ -117,6 +118,8 @@ function match(path) { const ordered=[...routes].sort((a,b)=>a.path.split('/').f
 function resourceGuard(route,params) {
  const s=getState(),p=route.path;let collection,id,action;
  if(route.module==='checkout')return null;
+ // The learning room resolves its own scope: locked purchase recovery, lapsed-grant recovery or scoped denial.
+ if(p==='/student/course/:id')return null;
  if(params.gradeId&&!s.grades.some(x=>x.id===params.gradeId))return 'missing';
  if(route.module==='public' && ['/course/:id','/teacher/:id','/explore/grade/:gradeId/subject/:subjectId'].includes(p))return null;
  if(params.subjectId&&!s.subjects.some(x=>x.id===params.subjectId))return 'missing';
@@ -167,6 +170,6 @@ function delegate(event) { const target=event.target instanceof Element?event.ta
  if(event.type==='submit'||(event.type==='click'&&!el.matches('a[href]')))event.preventDefault();
  try {handler(event,el,ctx);}catch(error){console.error('Action failed',error);}
 }
-export function startRouter() { if(started)return;started=true;publicActions(registerActions);authActions(registerActions);checkoutActions(registerActions);shellActions(registerActions);overlayActions(registerActions);for(const event of ['click','submit','change','input'])document.addEventListener(event,delegate);window.addEventListener('hashchange',scheduleRender);unsubscribe=subscribe(scheduleRender);renderCurrent();stopSwitcher=mountSwitcher(document.getElementById('switcher-root')); }
+export function startRouter() { if(started)return;started=true;publicActions(registerActions);authActions(registerActions);checkoutActions(registerActions);student.registerActions(registerActions);shellActions(registerActions);overlayActions(registerActions);for(const event of ['click','submit','change','input'])document.addEventListener(event,delegate);window.addEventListener('hashchange',scheduleRender);unsubscribe=subscribe(scheduleRender);renderCurrent();stopSwitcher=mountSwitcher(document.getElementById('switcher-root')); }
 // Optional lifecycle hook for embedding the prototype in a test harness.
 export function stopRouter() { if(!started)return;started=false;cleanup();stopSwitcher();unsubscribe();disposeOverlays();for(const event of ['click','submit','change','input'])document.removeEventListener(event,delegate);window.removeEventListener('hashchange',scheduleRender);handlers.clear();lastHash=null; }
