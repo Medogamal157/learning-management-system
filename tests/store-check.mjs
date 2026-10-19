@@ -1193,4 +1193,159 @@ dictionary.unknown=unknownEntry;
 resetDemoData();dispatch('preferences.set',{role:'visitor',lang:'ar'});
 console.log(`P6 render smoke: ${p6Renders} renders`);
 
+// ---------------------------------------------------------------- P7 assistant workspace
+const p7Reset=()=>p6Reset('assistant');
+const conv7=id=>getState().conversations.find(q=>q.id===id);
+const ASSISTANT_SELECTORS=['assistant.overview','assistant.courses','assistant.inbox','assistant.qa','assistant.tasks','assistant.settings'];
+check('P7 scope: assistant sees exactly C-001 and C-002 and only assigned conversations Q-001..Q-003',()=>{
+ p7Reset();
+ assert.deepEqual(select('assistant.courses').courses.map(c=>c.id),['C-001','C-002']);
+ assert.deepEqual(Object.fromEntries(select('assistant.courses').courses.map(c=>[c.id,c.capabilities])),{'C-001':['reply_conversation','read_content','grade_assignment'],'C-002':['reply_conversation','read_content','edit_content']});
+ const o=select('assistant.overview');assert.deepEqual([o.active,o.counts.courses,o.counts.open,o.counts.due],[true,2,3,2]);assert.equal(L(o.owner),L(getState().teachers.find(x=>x.id==='T-001').name));
+ const all=()=>['open','assigned','escalated','resolved'].flatMap(tab=>select('assistant.inbox',{tab}).rows.map(q=>q.id));
+ assert.deepEqual(all().sort(),['Q-001','Q-002','Q-003']);assert.deepEqual(select('assistant.inbox',{tab:'assigned'}).counts,{open:0,assigned:3,escalated:0,resolved:0,waiting:0});
+ assert.deepEqual(select('assistant.qa').courses.flatMap(c=>c.questions.map(q=>q.id)).sort(),['Q-001','Q-002'],'lesson_qa only');
+ assert.equal(select('assistant.course',{id:'C-004'}).status,'denied');assert.equal(select('assistant.course',{id:'C-005'}).status,'denied','owned by T-001 but not assigned');assert.equal(select('assistant.course',{id:'C-999'}).status,'missing');
+ assert.equal(select('resource',{collection:'courses',id:'C-004',action:'course.read'}).status,'denied','router guard');
+ assert.ok(!JSON.stringify(ASSISTANT_SELECTORS.map(n=>select(n,{tab:'open'}))).match(/guardian|masked_iban|price_baisa|commission|email":"(?!noora)/),'no finance/guardian/learner contact data');
+});
+check('P7 unassigned C-001 conversation and C-004 are denied for read and every action without leaking names',()=>{
+ p7Reset();const pre=getState();
+ for(const id of ['Q-004','Q-005','Q-007']){assert.equal(select('assistant.thread',{id}).status,'denied',id);assert.equal(can('conversation.read',conv7(id)),false,id);assert.equal(select('resource',{collection:'conversations',id,action:'conversation.read'}).status,'denied',id);}
+ assert.equal(select('assistant.thread',{id:'Q-999'}).status,'missing');
+ for(const [type,payload] of [['conversation.reply',{conversationId:'Q-005',text:'Hello there'}],['conversation.note',{conversationId:'Q-005',text:'Internal note'}],['conversation.setStatus',{conversationId:'Q-004',status:'resolved'}],['conversation.report',{conversationId:'Q-005',reason:'privacy'}],['conversation.assign',{conversationId:'Q-005',assigneeUserId:'U-A001'}],['conversation.reply',{conversationId:'Q-007',text:'Hello there'}],['submission.grade',{submissionId:'SUB-005',score:'80',feedback:'Nice work'}]])assert.ok(['resourceDenied','p6.teacherOnly'].includes(dispatch(type,payload).errorKey),type);
+ assert.equal(getState(),pre,'no mutation');
+ const {html:h1,ctx:c1}=p6Render('/assistant/inbox/:id',{id:'Q-005'});assert.equal(h1,fallback('resourceDenied',c1));assert.ok(!h1.includes(esc(L(conv7('Q-005').subject))));
+ const {html:h2,ctx:c2}=p6Render('/assistant/course/:id',{id:'C-004'});assert.equal(h2,fallback('resourceDenied',c2));assert.ok(!h2.includes(esc(L(course('C-004').title))));
+ const {html:h3,ctx:c3}=p6Render('/assistant/course/:id',{id:'C-999'});assert.equal(h3,fallback('missing',c3));
+});
+check('P7 grading: allowed on C-001 (grade + release notifies learner); forged grading on C-002 rejected',()=>{
+ p7Reset();
+ const g=select('assistant.tasks').grading;assert.deepEqual(g.map(c=>[c.id,c.allowed]),[['C-001',true],['C-002',false]]);assert.deepEqual(g[1].submissions,[],'no C-002 submissions exposed');
+ assert.deepEqual(g[0].submissions.map(x=>x.id).sort(),['SUB-001','SUB-002']);
+ assert.equal(dispatch('submission.grade',{submissionId:'SUB-001',score:'101',feedback:'Great'}).fieldErrors.score,'p6.scoreRange');
+ assert.ok(dispatch('submission.grade',{submissionId:'SUB-001',score:'88',feedback:'Correct division and check.'}).ok);
+ const grade=getState().assessment_grades.find(x=>x.submission_id==='SUB-001');assert.equal(grade.grader_user_id,'U-A001');
+ assert.ok(dispatch('submission.release',{submissionId:'SUB-001'}).ok);assert.deepEqual(notesFor('grade-released-'+grade.id).map(n=>n.recipient_user_id),['U-S004']);
+ const pre=getState();
+ assert.equal(dispatch('submission.grade',{submissionId:'SUB-003',score:'50',feedback:'Forged grade'}).errorKey,'resourceDenied');assert.equal(dispatch('submission.release',{submissionId:'SUB-003'}).errorKey,'resourceDenied');
+ assert.equal(can('grade_assignment',course('C-002')),false);assert.equal(getState(),pre);
+ const html=p6Render('/assistant/tasks',{},'tab=grading').html;assert.ok(html.includes(esc(t('p7.capDeniedBody'))),'denied capability explained');
+});
+check('P7 content: lesson text edit allowed on C-002 via lesson.update; rejected on C-001 and for owner-only fields',()=>{
+ p7Reset();
+ const c=select('assistant.tasks').content;assert.deepEqual(c.map(x=>[x.id,x.allowed]),[['C-001',false],['C-002',true]]);assert.equal(c[1].tasks[0].target.id,'L-012');
+ assert.equal(select('assistant.course',{id:'C-001'}).canEdit,false);assert.equal(select('assistant.course',{id:'C-002'}).canEdit,true);
+ const r=dispatch('lesson.update',{lessonId:'L-012',title_ar:'كيف يعمل العلماء خطوة بخطوة',title_en:'How scientists work, step by step',body:'Observe, ask a question, test it and record the results.'});assert.ok(r.ok,JSON.stringify(r));
+ const l=getState().lessons.find(x=>x.id==='L-012');assert.deepEqual([l.title.en,l.state,l.body.en,l.transcript.en],['How scientists work, step by step','published','Observe, ask a question, test it and record the results.','Observe, ask a question, test it and record the results.']);
+ assert.deepEqual(getState().audit_events.at(-1),{...getState().audit_events.at(-1),actor_user_id:'U-A001',action:'lesson.assistant_edit',resource_type:'course',resource_id:'C-002',after_summary:'L-012'});
+ const pre=getState();
+ assert.equal(dispatch('lesson.update',{lessonId:'L-012',state:'draft'}).errorKey,'p7.ownerOnlyField');assert.equal(dispatch('lesson.update',{lessonId:'L-012',preview:true}).errorKey,'p7.ownerOnlyField');
+ assert.equal(dispatch('lesson.update',{lessonId:'L-003',title_ar:'عنوان مزور للدرس',title_en:'Forged lesson title'}).errorKey,'resourceDenied','C-001 has no edit_content');
+ assert.equal(dispatch('lesson.update',{lessonId:'L-030',title_ar:'عنوان مزور للدرس',title_en:'Forged lesson title'}).errorKey,'resourceDenied','C-004');
+ for(const type of ['lesson.add','lesson.move','module.add','resource.add','course.saveDraft','announcement.post','live.schedule'])assert.ok(!dispatch(type,{courseId:'C-002',lessonId:'L-012',moduleId:'MOD-004',direction:'down',step:'identity',values:{}}).ok,type);
+ assert.equal(getState(),pre);
+ dispatch('preferences.set',{role:'teacher'});assert.ok(select('teacher.workspace',{id:'C-002'}).history.some(e=>e.action==='lesson.assistant_edit'));
+});
+check('P7 reply + internal note: learner sees attributed reply, never the note; waiting filter',()=>{
+ p7Reset();
+ assert.equal(dispatch('conversation.reply',{conversationId:'Q-001',text:' '}).fieldErrors.text,'error.required');
+ assert.ok(dispatch('conversation.reply',{conversationId:'Q-001',text:'Try a second plant in the shade and compare.'}).ok);
+ assert.ok(dispatch('conversation.note',{conversationId:'Q-001',text:'Private: suggest the light diary worksheet.'}).ok);
+ assert.ok(select('assistant.thread',{id:'Q-001'}).messages.some(m=>m.internal&&m.text.includes('light diary')),'assistant sees own note');
+ assert.ok(dispatch('conversation.setStatus',{conversationId:'Q-002',status:'waiting'}).ok);
+ assert.deepEqual(select('assistant.inbox',{tab:'assigned',waiting:true}).rows.map(q=>q.id),['Q-002']);assert.equal(select('assistant.inbox',{tab:'assigned'}).counts.waiting,1);
+ dispatch('preferences.set',{role:'student'});const th=select('student.thread',{id:'Q-001'});
+ assert.ok(th.messages.some(m=>m.text==='Try a second plant in the shade and compare.'&&m.author_role==='assistant'));assert.ok(!JSON.stringify(th).includes('light diary'));
+ assert.ok(!JSON.stringify(select('student.room',{courseId:'C-002'})).includes('light diary'));
+ dispatch('preferences.set',{role:'guardian'});assert.ok(!JSON.stringify(select('guardian.child',{id:'S-001'})).includes('light diary'));
+});
+check('P7 scenario 7: student question → teacher assigns Noora → reply/note/escalate → teacher resolves; learner never sees the note',()=>{
+ p6Reset('student');const ask=dispatch('qa.ask',{courseId:'C-002',lessonId:'L-011',subject:'Why do leaves change colour?',text:'Our neem tree leaves turned yellow this week.'});assert.ok(ask.ok);const id=ask.data.conversationId;
+ dispatch('preferences.set',{role:'assistant'});assert.equal(select('assistant.thread',{id}).status,'denied','not yet assigned');
+ dispatch('preferences.set',{role:'teacher'});assert.ok(dispatch('conversation.assign',{conversationId:id,assigneeUserId:'U-A001'}).ok);
+ dispatch('preferences.set',{role:'assistant'});assert.ok(select('assistant.inbox',{tab:'assigned'}).rows.some(q=>q.id===id));assert.ok(select('assistant.qa').courses.find(c=>c.id==='C-002').questions.some(q=>q.id===id));
+ assert.ok(select('notifications').some(n=>n.href==='#/assistant/inbox/'+id));
+ assert.ok(dispatch('conversation.reply',{conversationId:id,text:'Great question! Leaves change when the tree saves water.'}).ok);
+ assert.ok(dispatch('conversation.note',{conversationId:id,text:'Owner: please confirm the neem tree example.'}).ok);
+ assert.deepEqual(select('assistant.thread',{id}).conversation.next,['waiting','resolved','escalated']);
+ assert.ok(dispatch('conversation.setStatus',{conversationId:id,status:'escalated'}).ok);
+ assert.deepEqual(select('assistant.thread',{id}).conversation.next,[],'owner decides');assert.ok(select('assistant.inbox',{tab:'escalated'}).rows.some(q=>q.id===id));
+ assert.equal(dispatch('conversation.setStatus',{conversationId:id,status:'resolved'}).errorKey,'p6.ownerOnly');
+ dispatch('preferences.set',{role:'teacher'});const ti=select('teacher.inbox',{status:'escalated'});assert.ok(ti.rows.some(q=>q.id===id));
+ assert.ok(getState().notifications.some(n=>n.recipient_user_id==='U-T001'&&n.type==='escalation'&&n.href==='#/teacher/inbox/'+id));
+ assert.ok(select('teacher.thread',{id}).messages.some(m=>m.internal&&m.author_role==='assistant'));
+ assert.ok(dispatch('conversation.setStatus',{conversationId:id,status:'resolved'}).ok);
+ dispatch('preferences.set',{role:'student'});const th=select('student.thread',{id});
+ assert.equal(th.conversation?.state??conv7(id).state,'resolved');assert.ok(th.messages.some(m=>m.text.startsWith('Great question!')));assert.ok(!JSON.stringify(th).includes('neem tree example'));
+ dispatch('preferences.set',{role:'assistant'});assert.ok(select('assistant.inbox',{tab:'resolved'}).rows.some(q=>q.id===id));
+});
+check('P7 tasks: assignee + matching capability only; grading closes after grading; owner notified once',()=>{
+ p7Reset();
+ assert.equal(dispatch('task.setState',{taskId:'TASK-001',state:'done'}).errorKey,'p7.gradeFirst');
+ assert.ok(dispatch('task.setState',{taskId:'TASK-001',state:'in_progress'}).ok);assert.equal(dispatch('task.setState',{taskId:'TASK-001',state:'open'}).errorKey,'p6.invalidTransition');
+ assert.ok(dispatch('submission.grade',{submissionId:'SUB-001',score:'90',feedback:'Well checked.'}).ok);assert.ok(dispatch('task.setState',{taskId:'TASK-001',state:'done'}).ok);
+ assert.ok(dispatch('task.setState',{taskId:'TASK-001',state:'done'}).data.existing);assert.equal(notesFor('task-done-TASK-001').length,1);assert.equal(notesFor('task-done-TASK-001')[0].recipient_user_id,'U-T001');
+ assert.ok(dispatch('task.setState',{taskId:'TASK-003',state:'done'}).ok);
+ for(const id of ['TASK-002','TASK-004','TASK-999'])assert.ok(['resourceDenied','missing'].includes(dispatch('task.setState',{taskId:id,state:'done'}).errorKey),id);
+ assert.equal(select('assistant.overview').counts.due,0);
+});
+check('P7 revocation: after team.revoke of TM-001 every assistant selector is empty/denied and every action rejected',()=>{
+ p7Reset();dispatch('preferences.set',{role:'teacher'});assert.ok(dispatch('team.revoke',{memberId:'TM-001'}).ok);dispatch('preferences.set',{role:'assistant'});
+ const o=select('assistant.overview');assert.deepEqual([o.active,o.courses,o.queue,o.tasks,o.counts],[false,[],[],[],{courses:0,open:0,due:0}]);
+ assert.deepEqual(select('assistant.courses').courses,[]);assert.deepEqual(select('assistant.qa').courses,[]);
+ const tk=select('assistant.tasks');assert.deepEqual([tk.grading,tk.content],[[],[]]);
+ for(const tab of ['open','assigned','escalated','resolved']){const d=select('assistant.inbox',{tab});assert.deepEqual(d.rows,[]);assert.ok(Object.values(d.counts).every(n=>n===0));}
+ for(const id of ['C-001','C-002'])assert.equal(select('assistant.course',{id}).status,'denied',id);for(const id of ['Q-001','Q-002','Q-003'])assert.equal(select('assistant.thread',{id}).status,'denied',id);
+ const st=select('assistant.settings');assert.deepEqual([st.active,st.courses,st.member],[false,[],null]);
+ assert.ok(select('notifications').every(n=>!n.related_course_id),'course-linked notices hidden');
+ for(const id of ['C-001','C-002'])assert.equal(select('resource',{collection:'courses',id,action:'course.read'}).status,'denied');
+ const pre=getState();
+ for(const [type,payload] of [['conversation.reply',{conversationId:'Q-001',text:'Still here?'}],['conversation.note',{conversationId:'Q-002',text:'Note'}],['conversation.setStatus',{conversationId:'Q-003',status:'resolved'}],['submission.grade',{submissionId:'SUB-001',score:'80',feedback:'Good'}],['submission.release',{submissionId:'SUB-002'}],['lesson.update',{lessonId:'L-012',title_ar:'عنوان بعد الإلغاء',title_en:'Title after revoke'}],['task.setState',{taskId:'TASK-003',state:'done'}],['teacher.saveForm',{name:'areply:Q-001',values:{text:'x'}}]])assert.ok(!dispatch(type,payload).ok,type);
+ assert.equal(getState(),pre,'no mutation after revoke');
+});
+check('P7 finance and admin stay denied for the assistant',()=>{
+ p7Reset();
+ for(const r of routes.filter(r=>r.path.startsWith('/admin')||r.path.startsWith('/teacher/earnings')))assert.ok(!r.roles.includes('assistant'),r.path);
+ assert.equal(routes.filter(r=>r.module==='assistant'&&r.roles.join()==='assistant').length,9);
+ assert.ok(routes.filter(r=>r.module==='assistant').every(r=>typeof r.view.render==='function'&&!r.view.render.toString().includes('coming')),'no placeholder');
+ for(const action of ['finance.read','finance.prepare_payout','approve_payout','earnings.read'])assert.equal(can(action,{module:'finance'}),false,action);
+ assert.equal(can('earnings.read',course('C-001')),false);assert.equal(select('teacher.earnings'),null);assert.equal(select('teacher.dashboard'),null);
+ assert.equal(dispatch('payoutAccount.requestChange',{beneficiaryName:'Noora',accountRef:'1234',consent:true}).errorKey,'p6.teacherOnly');
+ assert.equal(dispatch('team.assign',{memberId:'TM-001',assignments:{'C-005':['edit_content']}}).errorKey,'p6.teacherOnly','no self escalation');
+ assert.equal(dispatch('assistant.updateSettings',{prefs:{in_app:'on'}}).ok,true);
+ dispatch('preferences.set',{role:'teacher'});assert.equal(dispatch('assistant.updateSettings',{prefs:{}}).errorKey,'resourceDenied');
+});
+let p7Renders=0;
+dictionary.unknown={ar:'MISSING_DICTIONARY_KEY',en:'MISSING_DICTIONARY_KEY'};
+for(const lang of ['ar','en']){
+ p7Reset();dispatch('preferences.set',{lang});
+ const run=(list,tag='')=>{for(const [path,params={},query=''] of list)check(`P7 render ${lang}${tag} ${path} ${JSON.stringify(params)} ${query}`,()=>{
+  const before=getState(),{html}=p6Render(path,params,query);p7Renders++;assert.equal(getState(),before,'render is read-only');assert.ok(html.length>0);
+  assert.doesNotMatch(html,/undefined|NaN|\[object Object\]|MISSING_DICTIONARY_KEY/);assert.doesNotMatch(html.replace(/<[^>]+>/g,' '),/\b(?:p2|p3|p4|p5|p6|p7|error|status|route)\.[\w./:-]+/);
+ });};
+ const cases=[['/assistant'],['/assistant/courses'],['/assistant/inbox'],['/assistant/inbox',{},'tab=assigned&filter=waiting'],['/assistant/qa'],['/assistant/notifications'],['/assistant/notifications',{},'filter=unread'],['/assistant/settings'],['/assistant/inbox/:id',{id:'Q-001'}],['/assistant/inbox/:id',{id:'Q-003'}],['/assistant/inbox/:id',{id:'Q-005'}],['/assistant/course/:id',{id:'C-004'}]];
+ for(const tab of teacherRoute('/assistant/inbox').queryValues.tab)cases.push(['/assistant/inbox',{},'tab='+tab]);
+ for(const tab of teacherRoute('/assistant/tasks').queryValues.tab)cases.push(['/assistant/tasks',{},'tab='+tab]);
+ for(const id of ['C-001','C-002'])for(const tab of [...teacherRoute('/assistant/course/:id').queryValues.tab,'bogus'])cases.push(['/assistant/course/:id',{id},'tab='+tab]);
+ run(cases);
+ // Mutated branches: graded/released submissions, escalated/waiting threads, done tasks, field errors, edits.
+ dispatch('teacher.saveForm',{name:'alesson:L-012',values:{title_ar:'x'},fieldErrors:dispatch('lesson.update',{lessonId:'L-012',title_ar:'x',title_en:'y'}).fieldErrors});
+ dispatch('submission.grade',{submissionId:'SUB-001',score:'70',feedback:'Good start'});dispatch('submission.release',{submissionId:'SUB-002'});dispatch('task.setState',{taskId:'TASK-003',state:'in_progress'});
+ dispatch('conversation.note',{conversationId:'Q-001',text:'<img src=x onerror=alert(1)>'});dispatch('conversation.setStatus',{conversationId:'Q-001',status:'escalated'});dispatch('conversation.setStatus',{conversationId:'Q-002',status:'waiting'});dispatch('conversation.setStatus',{conversationId:'Q-003',status:'resolved'});
+ dispatch('conversation.report',{conversationId:'Q-002',reason:'other'});dispatch('notifications.markAllRead',{});
+ run([['/assistant'],['/assistant/inbox',{},'tab=escalated'],['/assistant/inbox',{},'tab=resolved'],['/assistant/inbox/:id',{id:'Q-001'}],['/assistant/inbox/:id',{id:'Q-002'}],['/assistant/inbox/:id',{id:'Q-003'}],['/assistant/qa'],['/assistant/tasks',{},'tab=grading'],['/assistant/tasks',{},'tab=content'],['/assistant/course/:id',{id:'C-002'},'tab=content'],['/assistant/course/:id',{id:'C-002'},'tab=tasks'],['/assistant/notifications',{},'filter=unread']],' mutated');
+ check(`P7 render ${lang} escapes user text in internal notes`,()=>{const {html}=p6Render('/assistant/inbox/:id',{id:'Q-001'});assert.ok(html.includes('&lt;img src=x onerror=alert(1)&gt;'));assert.ok(!html.includes('<img src=x'));});
+ dispatch('preferences.set',{role:'teacher'});dispatch('team.revoke',{memberId:'TM-001'});dispatch('preferences.set',{role:'assistant'});
+ const revoked=[['/assistant'],['/assistant/courses'],['/assistant/inbox'],['/assistant/qa'],['/assistant/tasks',{},'tab=grading'],['/assistant/tasks',{},'tab=content'],['/assistant/notifications'],['/assistant/settings'],['/assistant/inbox/:id',{id:'Q-001'}],['/assistant/course/:id',{id:'C-001'},'tab=content']];
+ run(revoked,' revoked');
+ check(`P7 render ${lang} revoked state explains and leaks no course or learner names`,()=>{
+  for(const [path,params={},query=''] of revoked){const {html,ctx}=p6Render(path,params,query);for(const id of ['C-001','C-002'])assert.ok(!html.includes(esc(L(course(id).title))),path+id);assert.ok(!html.includes(esc(L(student('S-004').name))),path);if(params.id)assert.equal(html,fallback('resourceDenied',ctx));}
+  assert.ok(p6Render('/assistant/courses').html.includes(esc(t('p7.noAccessBody'))));
+ });
+}
+dictionary.unknown=unknownEntry;
+resetDemoData();dispatch('preferences.set',{role:'visitor',lang:'ar'});
+console.log(`P7 render smoke: ${p7Renders} renders`);
+
 console.log(`${passed} checks passed${process.exitCode ? ' (with failures above)' : ''}`);

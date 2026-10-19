@@ -243,7 +243,8 @@ export function select(selector,args={}) {
  case 'homeBanner': return state.cms_pages.find(p=>p.slug==='home')?.sections.find(s=>s.kind==='banner')??null;
  case 'cycles': { const published=state.courses.filter(publicCourse);return [...new Set(state.grades.map(g=>g.cycle_key))].map(key=>{const grades=state.grades.filter(g=>g.cycle_key===key);return {key,label:grades[0].cycle_label,grades,course_count:published.filter(c=>grades.some(g=>g.id===find('grade_subjects',c.grade_subject_id).grade_id)).length};}); }
  case 'featuredTeachers': return state.teachers.filter(t=>t.application_status==='approved' && t.account_status==='active').map(t=>({...t,qualifications:qualificationLabels(t.id),published_course_count:state.courses.filter(c=>c.owner_teacher_id===t.id && publicCourse(c)).length})).filter(t=>!args.withCourses || t.published_course_count>0).slice(0,args.limit??Infinity);
- case 'notifications': return state.notifications.filter(n=>n.recipient_user_id===actor.user_id&&guardianNoticeVisible(state,actor,n));
+ // Assistants keep course-linked notices only while that course assignment is active (revocation hides them).
+ case 'notifications': return state.notifications.filter(n=>n.recipient_user_id===actor.user_id&&guardianNoticeVisible(state,actor,n)&&(state.preferences.role!=='assistant'||!n.related_course_id||!!assistantAssignment(n.related_course_id)));
  case 'notifications.count': return select('notifications').filter(n=>!n.read_at).length;
  case 'guardian.children': return state.students.filter(s=>can('child.read',s));
  case 'scopedCourses': return state.courses.filter(c=>can('course.read',c)).map(decorateCourse);
@@ -895,6 +896,7 @@ function courseChecklist(s,c) {
 const checklistBlocked=(s,c)=>courseChecklist(s,c).some(x=>x.blocking&&!x.ok);
 const snapshotOf=c=>structuredClone(Object.fromEntries(SNAPSHOT_FIELDS.map(k=>[k,c[k]])));
 function lessonGuardTeacher(s,actor,lessonId) { const lesson=s.lessons.find(l=>l.id===lessonId);if(!lesson)return {error:'missing'};const g=ownedCourse(s,actor,courseOfModule(s,lesson.module_id)?.id);return g.error?g:{...g,lesson}; }
+function lessonGuardAssistant(s,lessonId,can) { const lesson=s.lessons.find(l=>l.id===lessonId);if(!lesson)return {error:'missing'};const course=courseOfModule(s,lesson.module_id);return can('edit_content',course)?{course,lesson}:{error:'resourceDenied'}; }
 function lessonFields(v,partial,type) {
  const values={},errors={},has=k=>!partial||k in v;
  if(has('title_ar')||has('title_en')){const r=pairText({ar:v.title_ar,en:v.title_en},3,120);values.title=r.value;errors.title_ar=r.errors.ar;errors.title_en=r.errors.en;}
@@ -1000,17 +1002,25 @@ function workspaceView(s,a,ctx) {
   team:s.teacher_team_members.filter(m=>m.teacher_id===c.owner_teacher_id&&m.status==='active').map(m=>({member_id:m.id,name:userName(s,m.user_id),capabilities:s.course_team_assignments.find(x=>x.team_member_id===m.id&&x.course_id===c.id&&x.status==='active')?.capabilities??[]})).filter(m=>m.capabilities.length),
   analytics:{completions,active:learners.filter(r=>r.access==='active').length,average:learners.length?Math.round(learners.reduce((n,r)=>n+r.percent,0)/learners.length):0,questions:s.conversations.filter(q=>q.course_id===c.id).length,attempts:s.attempts.filter(x=>d.quizzes.some(q=>q.id===x.quiz_id)).length}};
 }
+// Staff-side thread parts shared by the owner (P6) and assigned assistant (P7) views; internal notes included.
+function staffMessages(s,q,actor) {
+ const st=s.students.find(x=>x.id===q.student_id);
+ const author=uid=>uid===st?.user_id?'student':s.teachers.some(x=>x.user_id===uid)?'teacher':s.teacher_team_members.some(x=>x.user_id===uid)?'assistant':'staff';
+ return s.messages.filter(m=>m.conversation_id===q.id&&m.moderation_state!=='removed').sort((a,b)=>a.created_at.localeCompare(b.created_at)).map(m=>({...m,author_role:author(m.author_user_id),author_name:userName(s,m.author_user_id),own:m.author_user_id===actor.user_id}));
+}
+const ownReports=(s,actor)=>new Set(s.safety_reports.filter(r=>r.reporter_user_id===actor.user_id).map(r=>r.message_id??'conversation:'+r.conversation_id));
+function conversationTrail(s,q) {
+ return [...s.conversation_assignments.filter(x=>x.conversation_id===q.id).map(x=>({id:x.id,at:x.created_at,action:'conversation.assign',actor:userName(s,x.assigned_by),detail:userName(s,x.assignee_user_id),status:x.status})),...s.audit_events.filter(e=>e.resource_type==='conversation'&&e.resource_id===q.id&&e.action!=='conversation.assign').map(e=>({id:e.id,at:e.created_at,action:e.action,actor:userName(s,e.actor_user_id),detail:e.after_summary,status:null}))].sort((a,b)=>b.at.localeCompare(a.at));
+}
 function threadView(s,{id},{actor}) {
  const teacher=teacherOf(s,actor);if(!teacher)return {status:'denied'};
  const q=s.conversations.find(x=>x.id===id);if(!q)return {status:'missing'};
  const c=s.courses.find(x=>x.id===q.course_id);if(c?.owner_teacher_id!==teacher.id)return {status:'denied'};
  const st=s.students.find(x=>x.id===q.student_id);
- const author=uid=>uid===st?.user_id?'student':s.teachers.some(x=>x.user_id===uid)?'teacher':s.teacher_team_members.some(x=>x.user_id===uid)?'assistant':'staff';
  return {status:'ok',conversation:q,course:teacherCourseCard(s,c),lesson:s.lessons.find(l=>l.id===q.lesson_id)??null,student:{id:st.id,name:st.name},
-  messages:s.messages.filter(m=>m.conversation_id===q.id&&m.moderation_state!=='removed').sort((a,b)=>a.created_at.localeCompare(b.created_at)).map(m=>({...m,author_role:author(m.author_user_id),author_name:userName(s,m.author_user_id),own:m.author_user_id===actor.user_id})),
+  messages:staffMessages(s,q,actor),
   assignee:userName(s,q.assigned_user_id),members:replyMembers(s,c.id),next:(CONVERSATION_NEXT[q.state]??[]).filter(x=>x!=='assigned'||q.assigned_user_id),
-  reported:new Set(s.safety_reports.filter(r=>r.reporter_user_id===actor.user_id).map(r=>r.message_id??'conversation:'+r.conversation_id)),
-  trail:[...s.conversation_assignments.filter(x=>x.conversation_id===q.id).map(x=>({id:x.id,at:x.created_at,action:'conversation.assign',actor:userName(s,x.assigned_by),detail:userName(s,x.assignee_user_id),status:x.status})),...s.audit_events.filter(e=>e.resource_type==='conversation'&&e.resource_id===q.id&&e.action!=='conversation.assign').map(e=>({id:e.id,at:e.created_at,action:e.action,actor:userName(s,e.actor_user_id),detail:e.after_summary,status:null}))].sort((a,b)=>b.at.localeCompare(a.at))};
+  reported:ownReports(s,actor),trail:conversationTrail(s,q)};
 }
 registerSelectors({
  'teacher.me':(s,_a,{actor})=>{const teacher=teacherOf(s,actor);return teacher?{teacher,user:s.users.find(u=>u.id===teacher.user_id)}:null;},
@@ -1071,10 +1081,11 @@ registerSelectors({
 });
 Object.assign(reducers,{
  // Transient wizard/form state so inline validation survives rerenders (teacher-authored strings only).
+ // Also backs the P7 assistant forms (same transient store, cleared on role switch).
  'teacher.saveForm':(s,p,{actor})=>{
-  if(!teacherOf(s,actor)||typeof p.name!=='string'||!/^[\w:-]{1,60}$/.test(p.name))return fail('invalidAction');
+  if((!teacherOf(s,actor)&&!assistantOf(s,actor))||typeof p.name!=='string'||!/^[\w:-]{1,60}$/.test(p.name))return fail('invalidAction');
   const values=Object.fromEntries(Object.entries(p.values??{}).filter(([k,v])=>/^\w{1,40}$/.test(k)&&typeof v==='string').map(([k,v])=>[k,v.slice(0,4000)]));
-  const fieldErrors=Object.fromEntries(Object.entries(p.fieldErrors??{}).filter(([k,v])=>/^\w{1,40}$/.test(k)&&typeof v==='string'&&/^(?:error|p4|p6)\.\w+$/.test(v)));
+  const fieldErrors=Object.fromEntries(Object.entries(p.fieldErrors??{}).filter(([k,v])=>/^\w{1,40}$/.test(k)&&typeof v==='string'&&/^(?:error|p4|p6|p7)\.\w+$/.test(v)));
   (s.transient.teacherForms??={})[p.name]={values,fieldErrors};return ok(null);
  },
  'teacher.clearForm':(s,p)=>{ if(s.transient.teacherForms&&typeof p.name==='string')delete s.transient.teacherForms[p.name];return ok(null); },
@@ -1173,13 +1184,18 @@ Object.assign(reducers,{
   const {values,errors}=lessonFields(p,false,p.type);if(!module)errors.moduleId='error.required';if(Object.keys(errors).length)return failFields(errors);
   const lesson=newLesson(s,module,values);publishLessonAlert(s,g.course,lesson);g.course.updated_at=DEMO_NOW;return ok({lessonId:lesson.id});
  },
- 'lesson.update':(s,p,{actor})=>{
-  const g=lessonGuardTeacher(s,actor,p.lessonId);if(g.error)return fail(g.error);const lock=contentLock(g.course);if(lock)return fail(lock);
+ // Owner edits any lesson field; an assistant holding edit_content on this exact course may revise
+ // title/text only (state, preview and duration stay owner publishing decisions) and every edit is audited.
+ 'lesson.update':(s,p,{actor,can})=>{
+  const assistant=s.preferences.role==='assistant';
+  const g=assistant?lessonGuardAssistant(s,p.lessonId,can):lessonGuardTeacher(s,actor,p.lessonId);if(g.error)return fail(g.error);const lock=contentLock(g.course);if(lock)return fail(lock);
+  if(assistant&&['duration','state','preview'].some(k=>k in p))return fail('p7.ownerOnlyField');
   const fields=Object.fromEntries(Object.entries(p).filter(([k])=>['title_ar','title_en','duration','state','preview','body'].includes(k)));
   if(!Object.keys(fields).length)return fail('invalidAction');
   const {values,errors}=lessonFields(fields,true,g.lesson.type);if(Object.keys(errors).length)return failFields(errors);
   const was=g.lesson.state;Object.assign(g.lesson,values,{updated_at:DEMO_NOW});
   if(values.body&&g.lesson.type==='video')g.lesson.transcript=structuredClone(values.body);
+  if(assistant)audit(s,actor,'lesson.assistant_edit','course',g.course.id,'',g.lesson.id,Object.keys(values).join('+'));
   if(was!=='published')publishLessonAlert(s,g.course,g.lesson);return ok({lessonId:g.lesson.id});
  },
  'lesson.move':(s,p,{actor})=>{
@@ -1419,5 +1435,107 @@ Object.assign(reducers,{
  'teacher.updateSettings':(s,p,{actor})=>{
   const teacher=teacherOf(s,actor);if(!teacher)return fail('p6.teacherOnly');
   teacher.notification_prefs=Object.fromEntries(TEACHER_PREFS.map(k=>[k,p.prefs?.[k]===true||p.prefs?.[k]==='on']));teacher.updated_at=DEMO_NOW;return ok({...teacher.notification_prefs});
+ },
+});
+
+// ---- P7 assistant workspace. Scope is re-derived on every read and action: an active team membership plus an
+// active course_team_assignment per course (see can()); each action needs its own capability, and conversations
+// additionally need an explicit active conversation_assignment. team.revoke therefore empties every selector at
+// once. Mutations reuse the P6 reducers (conversation.*, submission.*, lesson.update) whose guards call can().
+// No finance, guardian, enrollment export or learner contact data is returned — learner display names only.
+export const ASSISTANT_PREFS=['in_app','email_digest','assigned_alerts','task_alerts'];
+export const TASK_CAPABILITY=Object.freeze({grading:'grade_assignment',content:'edit_content'});
+const TASK_NEXT={open:['in_progress','done'],in_progress:['done']};
+const assistantOf=(s,actor)=>s.preferences.role==='assistant'?s.teacher_team_members.find(m=>m.id===actor.record_id&&m.user_id===actor.user_id&&m.status==='active'&&(!m.expires_at||m.expires_at>DEMO_NOW))??null:null;
+function assistantScope(s,actor) {
+ const m=assistantOf(s,actor);
+ return new Map(m?s.course_team_assignments.filter(a=>a.team_member_id===m.id&&a.status==='active'&&a.capabilities.length&&s.courses.some(c=>c.id===a.course_id)).map(a=>[a.course_id,TEAM_CAPABILITIES.filter(x=>a.capabilities.includes(x))]):[]);
+}
+const assignedConversations=(s,actor,scope)=>s.conversations.filter(q=>scope.get(q.course_id)?.includes('reply_conversation')&&s.conversation_assignments.some(a=>a.conversation_id===q.id&&a.assignee_user_id===actor.user_id&&a.status==='active')).sort((a,b)=>b.last_message_at.localeCompare(a.last_message_at));
+// Escalated threads belong to the owner until they reassign or resolve them.
+const assistantNext=q=>q.state==='escalated'?[]:(CONVERSATION_NEXT[q.state]??[]).filter(x=>x!=='assigned'||q.assigned_user_id);
+const ownerOf=(s,courseId)=>s.teachers.find(x=>x.id===s.courses.find(c=>c.id===courseId)?.owner_teacher_id)??null;
+const liveTitle=(s,courseId)=>s.courses.find(c=>c.id===courseId).title;
+function assistantRow(s,q) {
+ const visible=s.messages.filter(m=>m.conversation_id===q.id&&!m.internal&&m.moderation_state!=='removed').sort((a,b)=>a.created_at.localeCompare(b.created_at));
+ return {...q,course_title:liveTitle(s,q.course_id),student_name:s.students.find(x=>x.id===q.student_id)?.name??null,lesson_title:s.lessons.find(l=>l.id===q.lesson_id)?.title??null,last_text:visible.at(-1)?.text??'',message_count:visible.length,next:assistantNext(q)};
+}
+function assistantTasks(s,actor,scope) {
+ return s.tasks.filter(x=>x.assignee_user_id===actor.user_id&&scope.has(x.course_id)).sort((a,b)=>(a.state==='done')-(b.state==='done')||a.due_at.localeCompare(b.due_at)).map(x=>{
+  const allowed=scope.get(x.course_id).includes(TASK_CAPABILITY[x.kind]),lesson=x.kind==='content'?s.lessons.find(l=>l.id===x.target_id):null,sub=x.kind==='grading'?s.submissions.find(v=>v.id===x.target_id):null;
+  const target=!allowed?null:lesson?{id:lesson.id,title:lesson.title,type:lesson.type,state:lesson.state,body:lesson.body}:sub?{id:sub.id,state:sub.state,title:s.assignments.find(a=>a.id===sub.assignment_id)?.title??null,student_name:s.students.find(v=>v.id===sub.student_id)?.name??null}:null;
+  return {...x,course_title:liveTitle(s,x.course_id),allowed,capability:TASK_CAPABILITY[x.kind],target,next:allowed?TASK_NEXT[x.state]??[]:[]};
+ });
+}
+function assistantCourseCard(s,actor,scope,courseId) {
+ const c=s.courses.find(x=>x.id===courseId),gs=s.grade_subjects.find(x=>x.id===c.grade_subject_id),one=new Map([[courseId,scope.get(courseId)]]);
+ return {id:c.id,title:c.title,status:c.status,mode:c.mode,grade:s.grades.find(g=>g.id===gs?.grade_id)??null,subject:s.subjects.find(x=>x.id===gs?.subject_id)??null,owner:ownerOf(s,c.id)?.name??null,capabilities:scope.get(courseId),
+  lessons:lessonsIn(s,c.id).length,open:assignedConversations(s,actor,one).filter(q=>q.state!=='resolved').length,tasks:assistantTasks(s,actor,one).filter(x=>x.state!=='done').length};
+}
+const courseOutline=(s,courseId)=>s.modules.filter(m=>m.course_id===courseId).sort(byPosition).map(m=>({id:m.id,title:m.title,position:m.position,lessons:s.lessons.filter(l=>l.module_id===m.id).sort(byPosition).map(l=>({id:l.id,title:l.title,type:l.type,state:l.state,preview:l.preview,duration_seconds:l.duration_seconds,body:l.body}))}));
+function assistantSubmissions(s,courseId) {
+ const assignments=s.assignments.filter(a=>a.course_id===courseId);
+ return s.submissions.filter(x=>assignments.some(a=>a.id===x.assignment_id)).map(x=>{
+  const a=assignments.find(v=>v.id===x.assignment_id),st=s.students.find(v=>v.id===x.student_id),g=s.assessment_grades.find(v=>v.submission_id===x.id);
+  return {id:x.id,text:x.text,filename:x.filename,state:x.state,submitted_at:x.submitted_at,assignment:{id:a.id,title:a.title,max_score:a.max_score},student:{id:st.id,name:st.name},grade:g?{score:g.score,feedback:g.feedback,released_at:g.released_at,grader:userName(s,g.grader_user_id)}:null};
+ }).sort((a,b)=>(a.state==='released')-(b.state==='released')||a.submitted_at.localeCompare(b.submitted_at));
+}
+registerSelectors({
+ 'assistant.overview':(s,_a,{actor})=>{
+  const member=assistantOf(s,actor),scope=assistantScope(s,actor),open=assignedConversations(s,actor,scope).filter(q=>q.state!=='resolved').map(q=>assistantRow(s,q)),tasks=assistantTasks(s,actor,scope).filter(x=>x.state!=='done');
+  return {active:!!member,owner:member?s.teachers.find(x=>x.id===member.teacher_id)?.name??null:null,courses:[...scope.keys()].map(id=>assistantCourseCard(s,actor,scope,id)),
+   counts:{courses:scope.size,open:open.length,due:tasks.length},queue:open.slice(0,5),tasks:tasks.slice(0,4)};
+ },
+ 'assistant.courses':(s,_a,{actor})=>{const scope=assistantScope(s,actor);return {active:!!assistantOf(s,actor),courses:[...scope.keys()].map(id=>assistantCourseCard(s,actor,scope,id))};},
+ 'assistant.course':(s,{id},{actor})=>{
+  const c=s.courses.find(x=>x.id===id);if(!c)return {status:'missing'};
+  const scope=assistantScope(s,actor),caps=scope.get(id);if(!caps)return {status:'denied'};
+  const read=caps.includes('read_content');
+  return {status:'ok',course:assistantCourseCard(s,actor,scope,id),canRead:read,canEdit:caps.includes('edit_content'),contentLocked:contentLock(c),modules:read?courseOutline(s,id):[],tasks:assistantTasks(s,actor,new Map([[id,caps]]))};
+ },
+ 'assistant.inbox':(s,{tab,waiting},{actor})=>{
+  const all=assignedConversations(s,actor,assistantScope(s,actor)).map(q=>assistantRow(s,q));
+  const TAB={open:q=>q.state==='open',assigned:q=>['assigned','waiting'].includes(q.state),escalated:q=>q.state==='escalated',resolved:q=>q.state==='resolved'};
+  return {active:!!assistantOf(s,actor),rows:all.filter(TAB[tab]??TAB.open).filter(q=>!waiting||q.state==='waiting'),counts:{...Object.fromEntries(Object.entries(TAB).map(([k,f])=>[k,all.filter(f).length])),waiting:all.filter(q=>q.state==='waiting').length}};
+ },
+ 'assistant.thread':(s,{id},{actor})=>{
+  const q=s.conversations.find(x=>x.id===id);if(!q)return {status:'missing'};
+  if(!assignedConversations(s,actor,assistantScope(s,actor)).includes(q))return {status:'denied'};
+  return {status:'ok',conversation:assistantRow(s,q),owner:ownerOf(s,q.course_id)?.name??null,messages:staffMessages(s,q,actor),reported:ownReports(s,actor),trail:conversationTrail(s,q)};
+ },
+ 'assistant.qa':(s,_a,{actor})=>{
+  const scope=assistantScope(s,actor),rows=assignedConversations(s,actor,scope).filter(q=>q.kind==='lesson_qa').map(q=>assistantRow(s,q));
+  return {active:!!assistantOf(s,actor),courses:[...scope].filter(([,caps])=>caps.includes('reply_conversation')).map(([id])=>({id,title:liveTitle(s,id),questions:rows.filter(q=>q.course_id===id)})),reported:ownReports(s,actor)};
+ },
+ 'assistant.tasks':(s,_a,{actor})=>{
+  const scope=assistantScope(s,actor),tasks=assistantTasks(s,actor,scope);
+  const per=kind=>[...scope].map(([id,caps])=>{const allowed=caps.includes(TASK_CAPABILITY[kind]);return {id,title:liveTitle(s,id),allowed,capability:TASK_CAPABILITY[kind],contentLocked:contentLock(s.courses.find(c=>c.id===id)),tasks:tasks.filter(x=>x.course_id===id&&x.kind===kind),submissions:kind==='grading'&&allowed?assistantSubmissions(s,id):[]};});
+  return {active:!!assistantOf(s,actor),grading:per('grading'),content:per('content')};
+ },
+ 'assistant.settings':(s,_a,{actor})=>{
+  const user=s.preferences.role==='assistant'?s.users.find(u=>u.id===actor.user_id):null;if(!user)return null;
+  const member=assistantOf(s,actor),scope=assistantScope(s,actor);
+  return {user:{id:user.id,name:user.name,email:user.email},active:!!member,member:member?{id:member.id,team_role:member.team_role,since:member.created_at,expires_at:member.expires_at}:null,owner:member?s.teachers.find(x=>x.id===member.teacher_id)?.name??null:null,
+   courses:[...scope].map(([id,caps])=>({id,title:liveTitle(s,id),capabilities:caps})),prefs:Object.fromEntries(ASSISTANT_PREFS.map(k=>[k,user.notification_prefs?.[k]??true]))};
+ },
+});
+Object.assign(reducers,{
+ // Tasks: only the assignee, holding the capability the task kind needs on that course; grading tasks close
+ // only after the target submission is graded. Completion notifies the owner once.
+ 'task.setState':(s,p,{actor,can})=>{
+  const task=s.tasks.find(x=>x.id===p.taskId);if(!task)return fail('missing');
+  if(!actor.user_id||task.assignee_user_id!==actor.user_id||!can(TASK_CAPABILITY[task.kind],s.courses.find(c=>c.id===task.course_id)))return fail('resourceDenied');
+  if(task.state===p.state)return ok({taskId:task.id,state:task.state,existing:true});
+  if(!(TASK_NEXT[task.state]??[]).includes(p.state))return fail('p6.invalidTransition');
+  if(p.state==='done'&&task.kind==='grading'&&!['graded','released'].includes(s.submissions.find(x=>x.id===task.target_id)?.state))return fail('p7.gradeFirst');
+  const before=task.state;Object.assign(task,{state:p.state,updated_at:DEMO_NOW});audit(s,actor,'task.state','task',task.id,before,p.state);
+  const owner=ownerOf(s,task.course_id);
+  if(p.state==='done'&&owner&&owner.user_id!==actor.user_id)notifyUser(s,owner.user_id,{event:'task-done-'+task.id,type:'task_done',title:{ar:'أُنجزت مهمة مسندة',en:'Assigned task completed'},body:structuredClone(liveTitle(s,task.course_id)),href:`#/teacher/course/${task.course_id}?tab=${task.kind==='grading'?'resources':'lessons'}`,courseId:task.course_id});
+  return ok({taskId:task.id,state:task.state,existing:false});
+ },
+ // Personal preferences only; capabilities and roles are never editable by the assistant.
+ 'assistant.updateSettings':(s,p,{actor})=>{
+  if(s.preferences.role!=='assistant')return fail('resourceDenied');const user=s.users.find(u=>u.id===actor.user_id);if(!user)return fail('missing');
+  user.notification_prefs=Object.fromEntries(ASSISTANT_PREFS.map(k=>[k,p.prefs?.[k]===true||p.prefs?.[k]==='on']));user.updated_at=DEMO_NOW;return ok({...user.notification_prefs});
  },
 });

@@ -2191,6 +2191,60 @@ Object.assign(dictionary, Object.fromEntries([
  ['pref.in_app','إشعارات داخل المنصة','In-app notifications'],['pref.email_digest','ملخص بريد أسبوعي (محاكى)','Weekly email digest (simulated)'],['pref.qa_alerts','الأسئلة الجديدة والتصعيد','New questions and escalations'],['pref.review_updates','قرارات مراجعة الدورات','Course review decisions'],['pref.payout_updates','أحداث الصرف','Payout events'],
 ].map(([key,ar,en])=>['p6.'+key,{ar,en}])));
 
+// P7 assistant workspace.
+Object.assign(dictionary, Object.fromEntries([
+ // overview and courses
+ ['welcome','أهلاً {name}','Welcome, {name}'],['overviewIntro','العمل المسند إليك من فريق {owner} فقط.','Only the work assigned to you by {owner}’s team.'],['overviewRevoked','لا توجد عضوية فريق نشطة.','No active team membership.'],
+ ['statCourses','الدورات المسندة','Assigned courses'],['statOpen','محادثات مفتوحة مسندة','Open assigned conversations'],['statDue','مهام مستحقة','Tasks due'],
+ ['myQueue','قائمتي','My queue'],['queueEmpty','لا محادثات مفتوحة مسندة إليك.','No open conversations assigned to you.'],['dueTasks','المهام المستحقة','Tasks due'],['noDueTasks','لا مهام مستحقة.','No tasks due.'],
+ ['courseShortcuts','دوراتك المسندة','Your assigned courses'],['ownerLine','مالك الدورة: {name}','Course owner: {name}'],['cardMeta','الدروس المنشورة: {lessons} · المحادثات المفتوحة: {open} · المهام المفتوحة: {tasks}','Published lessons: {lessons} · Open conversations: {open} · Open tasks: {tasks}'],
+ ['openWorkspace','فتح مساحة الدورة','Open workspace'],['openInbox','الوارد المسند','Assigned inbox'],
+ ['scopeNote','ترى الدورات والمحادثات المسندة إليك صراحة فقط؛ لا بيانات مالية أو أولياء أمور أو طلاب آخرين.','You only see courses and conversations explicitly assigned to you; no finance, guardian or other learner data.'],
+ ['coursesIntro','الدورات التي منحك مالكها صلاحيات عليها، مع الصلاحيات الممنوحة لكل دورة.','Courses whose owner granted you access, with the capabilities granted on each.'],
+ ['membershipNote','عضوية الفريق وحدها لا تمنح الوصول إلى كل دورات المعلم؛ تظهر هنا الدورات المسندة فقط.','Team membership alone never grants access to all of a teacher’s courses; only assigned courses appear here.'],
+ ['noAccessTitle','لا يوجد عمل مسند','No assigned access'],['noAccessBody','أُلغيت عضويتك في الفريق أو لا توجد دورة مسندة إليك حالياً. اطلب من مالك الدورة منحك الصلاحية.','Your team membership was revoked or no course is currently assigned to you. Ask the course owner to grant access.'],['backToOverview','العودة إلى العمل المسند','Back to assigned work'],
+ ['capabilities','الصلاحيات','Capabilities'],['granted','ممنوحة','Granted'],['notGranted','غير ممنوحة','Not granted'],
+ ['capDeniedTitle','صلاحية «{cap}» غير ممنوحة','“{cap}” is not granted'],['capDeniedBody','اطلب من مالك الدورة منحك هذه الصلاحية. يرفض النظام هذا الإجراء حتى يُمنح.','Ask the course owner to grant this permission. The system rejects this action until it is granted.'],
+ // course workspace
+ ['wsTabs','أقسام مساحة الدورة','Course workspace sections'],['ws.overview','نظرة عامة','Overview'],['ws.content','المحتوى','Content'],['ws.tasks','المهام','Tasks'],
+ ['capsIntro','يحددها مالك الدورة لهذه الدورة وحدها.','Set by the course owner for this course only.'],
+ ['capHelp.reply_conversation','الرد على المحادثات المسندة إليك وإضافة ملاحظات داخلية.','Reply to conversations assigned to you and add internal notes.'],['capHelp.read_content','عرض الدروس ونصوصها.','View lessons and their text.'],['capHelp.grade_assignment','تصحيح المهام ونشر النتائج.','Grade assignments and release results.'],['capHelp.edit_content','تعديل عناوين الدروس ونصوصها.','Edit lesson titles and text.'],
+ ['owner','مالك الدورة','Course owner'],['courseStatus','حالة الدورة','Course status'],['lessonsCount','الدروس المنشورة','Published lessons'],['openAssigned','محادثاتك المفتوحة','Your open conversations'],['openTasks','مهامك المفتوحة','Your open tasks'],
+ ['boundariesTitle','حدود هذه المساحة','Workspace boundaries'],['boundaries','لا قوائم طلاب أو تصدير تسجيلات أو بيانات تواصل أو أرقام مالية في هذه المساحة.','No learner lists, enrollment exports, contact details or financial figures are available here.'],
+ ['editTitle','يمكنك تعديل النصوص','You can edit text'],['editNote','عدّل عناوين الدروس ونصوصها ضمن هذه الدورة؛ النشر والمعاينة والمدة تبقى قرار المالك، وكل تعديل يُسجَّل في سجل الدورة.','Edit lesson titles and text in this course; publishing, preview and duration stay with the owner, and every edit is logged in the course history.'],
+ ['readOnlyTitle','عرض فقط','Read only'],['readOnlyNote','لديك صلاحية عرض المحتوى فقط في هذه الدورة. لتعديله اطلب من مالك الدورة منحك صلاحية «تحرير المحتوى».','You can only view content in this course. To edit it, ask the course owner to grant “Edit content”.'],
+ ['editLesson','تعديل الدرس','Edit lesson'],['viewText','عرض النص','View text'],['preview','معاينة مجانية','Free preview'],['noLessons','لا دروس في هذه الوحدة.','No lessons in this module.'],
+ ['field.title_ar','العنوان بالعربية','Title (Arabic)'],['field.title_en','العنوان بالإنجليزية','Title (English)'],['field.body','نص الدرس','Lesson text'],['editScopeHint','تُحفظ العناوين والنص فقط؛ لا تتغير حالة النشر.','Only titles and text are saved; publication state does not change.'],
+ ['noCourseTasks','لا مهام مسندة إليك في هذه الدورة','No tasks assigned to you in this course'],['openTasks.grading','مهام التصحيح','Grading tasks'],['openTasks.content','مهام المحتوى','Content tasks'],
+ // tasks
+ ['task.grading','مهمة تصحيح','Grading task'],['task.content','مهمة محتوى','Content task'],['dueOn','الاستحقاق: {date}','Due {date}'],['taskTo.in_progress','بدء المهمة','Start task'],['taskTo.done','إكمال المهمة','Mark task done'],
+ ['taskStarted','بدأت المهمة.','Task started.'],['taskDone','اكتملت المهمة وأُبلغ مالك الدورة.','Task completed and the course owner notified.'],['gradeFirst','صحّح التسليم قبل إكمال المهمة.','Grade the submission before completing the task.'],
+ ['tasksIntro','صحّح وانشر النتائج أو حدّث المحتوى حسب الصلاحيات الممنوحة لكل دورة.','Grade and release results or update content, according to the capabilities granted per course.'],
+ ['tasksTabs','أنواع المهام','Task types'],['tasksTab.grading','التصحيح','Grading'],['tasksTab.content','المحتوى','Content'],
+ ['tasksNote.grading','تظهر التسليمات في الدورات التي تملك فيها صلاحية «تصحيح المهام» فقط. لا تظهر النتيجة للطالب حتى النشر.','Submissions appear only in courses where you hold “Grade assignments”. Learners see a result only after release.'],
+ ['tasksNote.content','تعديل المحتوى متاح فقط في الدورات التي تملك فيها صلاحية «تحرير المحتوى».','Content editing is available only in courses where you hold “Edit content”.'],
+ ['noTasksHere','لا مهام مسندة هنا.','No tasks assigned here.'],['submissions','التسليمات','Submissions'],['gradedBy','صححها: {name}','Graded by {name}'],
+ // inbox, thread and Q&A
+ ['inboxIntro','المحادثات المسندة إليك صراحة في دوراتك المسندة فقط.','Only conversations explicitly assigned to you in your assigned courses.'],['inboxTabs','صفوف الوارد','Inbox queues'],
+ ['waitingFilter','تصفية المسندة','Assigned filter'],['allAssigned','كل المسندة','All assigned'],['inboxEmptyBody','يسند مالك الدورة الأسئلة الجديدة إليك من صندوقه.','The course owner assigns new questions to you from their inbox.'],
+ ['inboxEmpty.open','لا محادثات مفتوحة','No open conversations'],['inboxEmpty.assigned','لا محادثات مسندة قيد العمل','No assigned conversations in progress'],['inboxEmpty.waiting','لا محادثات بانتظار رد الطالب','No conversations waiting for the learner'],['inboxEmpty.escalated','لا محادثات مصعّدة','No escalated conversations'],['inboxEmpty.resolved','لا محادثات محلولة','No resolved conversations'],
+ ['assignedToYou','مسندة إليك','Assigned to you'],['escalateTo','تصعيد إلى {name}','Escalate to {name}'],['escalate','تصعيد للمالك','Escalate to owner'],['escalated','صُعّدت المحادثة إلى مالك الدورة.','Conversation escalated to the course owner.'],
+ ['escalatedTitle','بانتظار مالك الدورة','Waiting for the course owner'],['escalatedNote','صُعّدت إلى {name}؛ يقرر المالك الحل أو إعادة الإسناد. يمكنك متابعة الرد والملاحظات.','Escalated to {name}; the owner resolves or reassigns it. You can still reply and add notes.'],
+ ['openHint','أعاد الطالب فتح المحادثة؛ ردك يعيدها إلى «مسندة».','The learner reopened this conversation; your reply moves it back to “assigned”.'],
+ ['context','السياق','Context'],['course','الدورة','Course'],['lesson','الدرس','Lesson'],['noLesson','بلا درس محدد','No specific lesson'],['learner','الطالب','Learner'],['noContactData','يظهر اسم الطالب فقط؛ لا بيانات تواصل أو أولياء أمور.','Only the learner’s name is shown; no contact or guardian details.'],
+ ['qaIntro','أسئلة الدروس المسندة إليك، مجمعة حسب الدورة والدرس.','Lesson questions assigned to you, grouped by course and lesson.'],['qaScope','تظهر أسئلة الدروس المسندة إليك في الدورات التي تملك فيها صلاحية الرد فقط.','Only lesson questions assigned to you in courses where you can reply appear here.'],
+ ['qaEmpty','لا أسئلة دروس مسندة إليك في هذه الدورة.','No lesson questions assigned to you in this course.'],['answer','إجابتك','Your answer'],
+ // notifications and settings
+ ['notificationsIntro','إسناد المحادثات والمهام والردود في دوراتك المسندة.','Conversation assignments, tasks and replies in your assigned courses.'],
+ ['settingsIntro','اسمك وتفضيلاتك الشخصية؛ الصلاحيات للعرض فقط.','Your name and personal preferences; capabilities are read only.'],['membershipEnded','انتهت عضويتك في فريق التدريس.','Your teaching team membership has ended.'],
+ ['nameNote','يظهر اسمك للطلاب على ردودك العلنية فقط؛ لا تُعرض بيانات تواصلك.','Your name is shown to learners on your public replies only; your contact details are never shown.'],
+ ['assignedCapabilities','الصلاحيات المسندة','Assigned capabilities'],['capsReadOnly','يمنحها مالك كل دورة ويعدّلها؛ لا يمكنك تغييرها من هنا.','Each course owner grants and changes these; you cannot change them here.'],
+ ['noEscalationTitle','لا ترقية للدور','No role escalation'],['noEscalation','لا يمكن للمساعد تغيير دوره أو منح نفسه صلاحيات أو الوصول إلى المالية.','An assistant cannot change their role, grant themselves capabilities or access finance.'],
+ ['pref.in_app','إشعارات داخل المنصة','In-app notifications'],['pref.email_digest','ملخص بريد أسبوعي (محاكى)','Weekly email digest (simulated)'],['pref.assigned_alerts','إسناد المحادثات','Conversation assignments'],['pref.task_alerts','المهام الجديدة','New tasks'],
+ ['ownerOnlyField','الحالة والمعاينة والمدة قرارات مالك الدورة.','State, preview and duration are course owner decisions.'],
+].map(([key,ar,en])=>['p7.'+key,{ar,en}])));
+Object.assign(dictionary, { 'p6.audit.lesson.assistant_edit': { ar: 'تعديل درس من المساعد', en: 'Lesson edited by assistant' }, 'p6.audit.task.state': { ar: 'تغيير حالة مهمة', en: 'Task state changed' } });
+
 export function esc(value) { return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 export function L(value) { if (value == null) return ''; if (typeof value !== 'object') return String(value); const lang=getState().preferences.lang; return value[lang] ?? value.en ?? value.ar ?? ''; }
 export function t(key, params={}) { return L(dictionary[key] ?? dictionary.unknown).replace(/\{(\w+)\}/g, (_, k) => String(params[k] ?? `{${k}}`)); }

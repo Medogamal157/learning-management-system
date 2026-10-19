@@ -639,3 +639,5 @@ export function registerActions(register) {
     markAllRead: (_e, _el, ctx) => report(ctx.dispatch('notifications.markAllRead', {}), 'allRead'),
   });
 }
+// Shared staff-workspace helpers reused by the assistant portal (views/assistant.js) for the same look and form flow.
+export { chip, when, day, url, sectionTitle, submit, formState, fe, fv, hasErrors, safeHash, auditLabel, choiceButtons, formAction, onSubmit, strings };
