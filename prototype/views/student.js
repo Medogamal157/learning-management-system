@@ -274,8 +274,8 @@ export const explore = {
 };
 
 // ---------------------------------------------------------------- calendar
-const dayKey = iso => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Muscat', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(iso));
-function weekDays(offset) {
+export const dayKey = iso => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Muscat', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(iso));
+export function weekDays(offset) {
   const [y, m, d] = dayKey(DEMO_NOW).split('-').map(Number), base = new Date(Date.UTC(y, m - 1, d, 12));
   base.setUTCDate(base.getUTCDate() - base.getUTCDay() + offset * 7);// Weeks start on Sunday (Oman school week).
   return Array.from({ length: 7 }, (_, i) => { const x = new Date(base); x.setUTCDate(base.getUTCDate() + i); return x.toISOString(); });

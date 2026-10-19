@@ -813,3 +813,611 @@ Object.assign(reducers,{
   g.notification_prefs=Object.fromEntries(GUARDIAN_PREFS.map(k=>[k,p.prefs?.[k]===true||p.prefs?.[k]==='on']));g.updated_at=DEMO_NOW;return ok({...g.notification_prefs});
  },
 });
+
+// ---- P6 teacher portal. The acting teacher always comes from the persona (never from payload IDs);
+// every read and mutation re-checks single ownership, so forged course, lesson, session or conversation
+// IDs fail closed. Published course metadata edits live in pending_revision until moderation approves.
+export const COURSE_STEPS=['identity','academics','content','assessments','live','access','review'];
+export const TEAM_CAPABILITIES=['reply_conversation','read_content','grade_assignment','edit_content'];
+export const TEAM_ROLES=['assistant','grader','content_editor'];
+export const LESSON_TYPES=['video','reading'];
+export const LESSON_STATES=['draft','ready','published'];
+export const TEACHER_PREFS=['in_app','email_digest','qa_alerts','review_updates','payout_updates'];
+export const INVITE_DAYS=['7','14','30'];
+const COURSE_MODES=['recorded','live','hybrid'];
+const COURSE_STATES=['Draft','Submitted','ChangesRequested','Published','Unpublished','Archived'];
+const EARNING_STATES=['pending','available','reserved','in_payout','paid','adjusted'];
+const SNAPSHOT_FIELDS=['title','summary','description','outcomes','prerequisites','price_type','price_baisa','mode','access_policy'];
+const BILINGUAL_FIELDS=['title','summary','description','outcomes','prerequisites'];
+const RECORDING_FILE=/^[\w؀-ۿ][\w؀-ۿ .()-]{0,75}\.(mp4|mov|webm)$/i;
+const RESOURCE_FILE=/^[\w؀-ۿ][\w؀-ۿ .()-]{0,75}\.(txt|pdf)$/i;
+// Conversation transitions (SPEC §3.1); open → assigned only through an explicit assignment or a staff reply.
+const CONVERSATION_NEXT={assigned:['waiting','resolved','escalated'],waiting:['assigned','resolved'],escalated:['assigned','resolved']};
+const teacherOf=(s,actor)=>s.preferences.role==='teacher'?s.teachers.find(x=>x.id===actor.record_id&&x.account_status==='active'&&x.application_status==='approved')??null:null;
+function ownedCourse(s,actor,courseId) {
+ const teacher=teacherOf(s,actor);if(!teacher)return {error:'p6.teacherOnly'};
+ const course=s.courses.find(c=>c.id===courseId);if(!course)return {error:'missing'};
+ return course.owner_teacher_id===teacher.id?{teacher,course}:{error:'resourceDenied'};
+}
+const qualifiedPairs=(s,teacherId)=>new Set(s.teacher_grade_subjects.filter(q=>q.teacher_id===teacherId&&q.verification_state==='verified'&&s.grade_subjects.some(g=>g.id===q.grade_subject_id&&g.active)).map(q=>q.grade_subject_id));
+const editView=c=>({...c,...(c.pending_revision?.fields??{})});
+const metaLock=c=>c.status==='Submitted'||c.pending_revision?.status==='Submitted'?'p6.lockedInReview':c.status==='Archived'?'p6.lockedArchived':null;
+const contentLock=c=>c.status==='Submitted'?'p6.lockedInReview':c.status==='Archived'?'p6.lockedArchived':null;
+const courseOfModule=(s,moduleId)=>s.courses.find(c=>c.id===s.modules.find(m=>m.id===moduleId)?.course_id)??null;
+function audit(s,actor,action,type,id,before,after,reason='') { s.audit_events.push({id:nextId(s.audit_events,'AUD'),actor_user_id:actor.user_id,action,resource_type:type,resource_id:id,before_summary:before,after_summary:after,reason,created_at:DEMO_NOW}); }
+const entitled=(s,courseId)=>s.students.filter(st=>activeGrantIn(s,st.id,courseId));
+function notifyLearners(s,courseId,{event,type,title,body,href}) { for(const st of entitled(s,courseId))notifyUser(s,st.user_id,{event,type,title,body,href,courseId}); }
+const userRoleIds=(s,role)=>s.role_assignments.filter(r=>r.role===role&&r.status==='active').map(r=>r.user_id);
+const parseOmr=v=>{ const m=/^(\d{1,4})(?:\.(\d{1,3}))?$/.exec(String(v??'').trim());return m?Number(m[1])*1000+Number((m[2]??'').padEnd(3,'0')):null; };
+// datetime-local input in Muscat time (UTC+4, no daylight saving) → UTC ISO; rolled-over dates are rejected.
+function muscatToUtc(v) {
+ const m=/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/.exec(String(v??''));if(!m)return null;
+ const ms=Date.UTC(+m[1],+m[2]-1,+m[3],+m[4]-4,+m[5]),back=new Date(ms+4*3600000);
+ return back.getUTCDate()===+m[3]&&back.getUTCMonth()===+m[2]-1&&back.getUTCHours()===+m[4]?new Date(ms).toISOString().replace('.000Z','Z'):null;
+}
+const dateEnd=v=>{ const m=/^(\d{4})-(\d{2})-(\d{2})$/.exec(String(v??''));if(!m)return null;const d=new Date(Date.UTC(+m[1],+m[2]-1,+m[3]));return d.getUTCDate()===+m[3]&&d.getUTCMonth()===+m[2]-1?`${m[1]}-${m[2]}-${m[3]}T19:59:59Z`:null; };
+const intIn=(v,min,max)=>{ const n=Number(v);return v!==''&&v!=null&&Number.isInteger(n)&&n>=min&&n<=max?n:null; };
+const pairText=(v,min,max)=>{ const ar=text(v?.ar,max),en=text(v?.en,max);return {value:{ar,en},errors:{ar:lengthError(ar,min),en:lengthError(en,min)}}; };
+const identityValues=c=>Object.fromEntries(BILINGUAL_FIELDS.flatMap(k=>[[k+'_ar',c[k]?.ar??''],[k+'_en',c[k]?.en??'']]));
+// Step validators shared by the wizard, the submit checklist and moderation (one source of truth).
+function validateCourseStep(s,teacher,step,v) {
+ const errors={},values={};
+ if(step==='identity') {
+  for(const [key,min,max] of [['title',5,120],['summary',10,300],['description',20,2000]]){const r=pairText({ar:v[key+'_ar'],en:v[key+'_en']},min,max);values[key]=r.value;errors[key+'_ar']=r.errors.ar;errors[key+'_en']=r.errors.en;}
+  for(const key of ['outcomes','prerequisites']){values[key]={ar:text(v[key+'_ar'],600),en:text(v[key+'_en'],600)};if(!values[key].ar!==!values[key].en)errors[key+(values[key].ar?'_en':'_ar')]='p6.bilingualPair';}
+ } else if(step==='academics') {
+  const version=s.curriculum_versions.find(x=>x.id===v.curriculum_version_id&&x.active),gs=s.grade_subjects.find(x=>x.id===v.grade_subject_id),year=s.academic_years.find(x=>x.id===v.academic_year_id),semester=s.semesters.find(x=>x.id===v.semester_id);
+  Object.assign(errors,{curriculum_version_id:version?null:'p6.versionInvalid',grade_subject_id:!v.grade_subject_id?'error.required':!gs||!teacher||!qualifiedPairs(s,teacher.id).has(gs.id)?'p6.notQualified':version&&gs.curriculum_version_id!==version.id?'p6.versionMismatch':null,academic_year_id:year?null:'error.required',semester_id:!semester?'error.required':semester.academic_year_id!==year?.id?'p6.semesterMismatch':null,language:['ar','en'].includes(v.language)?null:'error.required',mode:COURSE_MODES.includes(v.mode)?null:'error.required'});
+  Object.assign(values,{grade_subject_id:gs?.id,academic_year_id:year?.id,semester_id:semester?.id,track_id:gs?.track_id??null,language:v.language,mode:v.mode});
+ } else if(step==='access') {
+  const type=v.price_type,price=type==='paid'?parseOmr(v.price):0,kind=v.access_kind,end=kind==='academic_year'?ACCESS_END:dateEnd(v.access_end);
+  Object.assign(errors,{price_type:['free','paid'].includes(type)?null:'error.required',price:type==='paid'&&(!price||price>1000000)?'p6.pricePositive':null,access_kind:['academic_year','fixed_end'].includes(kind)?null:'error.required',access_end:kind==='fixed_end'&&(!end||end<=DEMO_NOW)?'p6.endFuture':null});
+  Object.assign(values,{price_type:type,price_baisa:price??0,access_policy:{kind,end_at:end}});
+ }
+ return {values,errors:pick(errors)};
+}
+// Review checklist: blocking items gate submission and approval; advisory items guide the teacher.
+function courseChecklist(s,c) {
+ const owner=s.teachers.find(x=>x.id===c.owner_teacher_id),v=editView(c),gs=s.grade_subjects.find(x=>x.id===v.grade_subject_id);
+ const lessons=s.modules.filter(m=>m.course_id===c.id).flatMap(m=>s.lessons.filter(l=>l.module_id===m.id&&['ready','published'].includes(l.state)));
+ const identity=!Object.keys(validateCourseStep(s,owner,'identity',identityValues(v)).errors).length;
+ const academics=!Object.keys(validateCourseStep(s,owner,'academics',{curriculum_version_id:gs?.curriculum_version_id,grade_subject_id:v.grade_subject_id,academic_year_id:v.academic_year_id,semester_id:v.semester_id,language:v.language,mode:v.mode}).errors).length;
+ const access=(v.price_type==='free'?v.price_baisa===0:v.price_type==='paid'&&Number.isInteger(v.price_baisa)&&v.price_baisa>0)&&!!v.access_policy?.end_at&&v.access_policy.end_at>DEMO_NOW;
+ return [
+  {id:'identity',step:'identity',ok:identity,blocking:true},{id:'academics',step:'academics',ok:academics,blocking:true},
+  {id:'owner',step:'review',ok:owner?.application_status==='approved'&&owner.account_status==='active',blocking:true},
+  {id:'access',step:'access',ok:access,blocking:true},{id:'content',step:'content',ok:lessons.length>0,blocking:true},
+  {id:'preview',step:'content',ok:lessons.some(l=>l.preview),blocking:false},
+  {id:'assessments',step:'assessments',ok:s.quizzes.some(q=>q.course_id===c.id)||s.assignments.some(a=>a.course_id===c.id),blocking:false},
+  {id:'live',step:'live',ok:v.mode==='recorded'||s.live_sessions.some(x=>x.course_id===c.id&&['scheduled','rescheduled','live'].includes(x.status)),blocking:false},
+ ];
+}
+const checklistBlocked=(s,c)=>courseChecklist(s,c).some(x=>x.blocking&&!x.ok);
+const snapshotOf=c=>structuredClone(Object.fromEntries(SNAPSHOT_FIELDS.map(k=>[k,c[k]])));
+function lessonGuardTeacher(s,actor,lessonId) { const lesson=s.lessons.find(l=>l.id===lessonId);if(!lesson)return {error:'missing'};const g=ownedCourse(s,actor,courseOfModule(s,lesson.module_id)?.id);return g.error?g:{...g,lesson}; }
+function lessonFields(v,partial,type) {
+ const values={},errors={},has=k=>!partial||k in v;
+ if(has('title_ar')||has('title_en')){const r=pairText({ar:v.title_ar,en:v.title_en},3,120);values.title=r.value;errors.title_ar=r.errors.ar;errors.title_en=r.errors.en;}
+ if(!partial){values.type=v.type;errors.type=LESSON_TYPES.includes(v.type)?null:'error.required';}
+ if(has('duration')){values.duration_seconds=(intIn(v.duration,1,180)??0)*60;errors.duration=values.duration_seconds?null:'p6.durationRange';}
+ if(has('state')){values.state=v.state;errors.state=LESSON_STATES.includes(v.state)?null:'error.required';}
+ if(has('preview'))values.preview=v.preview===true||v.preview==='on'||v.preview==='true';
+ if(has('body')&&!['quiz','assignment'].includes(type)){const body=text(v.body,4000);values.body=typed(body);errors.body=body&&body.length<10?'error.messageShort':lengthError(body,10);}
+ return {values,errors:pick(errors)};
+}
+function publishLessonAlert(s,course,lesson) {
+ if(course.status!=='Published'||lesson.state!=='published')return;
+ notifyLearners(s,course.id,{event:'lesson-published-'+lesson.id,type:'lesson_published',title:{ar:'درس جديد في دورتك',en:'New lesson in your course'},body:structuredClone(lesson.title),href:`#/student/course/${course.id}?tab=lessons&lesson=${lesson.id}`});
+}
+function newLesson(s,module,{title,type,duration_seconds,state,preview,body}) {
+ const id=nextId(s.lessons,'L'),position=Math.max(0,...s.lessons.filter(l=>l.module_id===module.id).map(l=>l.position))+1;
+ const lesson={id,module_id:module.id,title,type,position,duration_seconds,preview:!!preview,state,body:body??typed(''),transcript:type==='video'?structuredClone(body):typed(''),simulated_media_ref:type==='video'?'demo-video-'+id:null,completion_basis:{video:'video_90_percent',reading:'manual',quiz:'quiz_submit',assignment:'assignment_submit'}[type],created_at:DEMO_NOW,updated_at:DEMO_NOW};
+ s.lessons.push(lesson);return lesson;
+}
+function quizFields(v) {
+ const title=text(v.title,120),pass=intIn(v.pass_score,0,100),questions=(Array.isArray(v.questions)?v.questions:[]).slice(0,5).filter((q,i)=>i===0||text(q?.prompt,300)||(q?.choices??[]).some(c=>text(c,160)));
+ const errors={title:lengthError(title,3),pass_score:pass===null?'p6.passRange':null};
+ if(!questions.length)errors.q0_prompt='error.required';
+ const rows=questions.map((q,i)=>{const prompt=text(q?.prompt,300),choices=[0,1,2].map(c=>text(q?.choices?.[c],160)),correct=intIn(q?.correct,0,2);Object.assign(errors,{[`q${i}_prompt`]:lengthError(prompt,3),[`q${i}_choices`]:choices.every(Boolean)?null:'p6.choicesRequired',[`q${i}_correct`]:correct===null?'p6.correctRequired':null});return {prompt,choices,correct};});
+ return {values:{title,pass_score:pass,questions:rows},errors:pick(errors)};
+}
+function assignmentFields(v) {
+ const title=text(v.title,120),instructions=text(v.instructions,2000),due=dateEnd(v.due),max=intIn(v.max_score,1,100);
+ return {values:{title,instructions,due_at:due?due.replace('19:59:59Z','15:59:59Z'):null,max_score:max},errors:pick({title:lengthError(title,3),instructions:instructions&&instructions.length<10?'error.messageShort':lengthError(instructions,10),due:!due?'error.required':due<=DEMO_NOW?'p6.dueFuture':null,max_score:max===null?'p6.maxRange':null})};
+}
+function sessionGuard(s,actor,sessionId) { const x=s.live_sessions.find(v=>v.id===sessionId);if(!x)return {error:'missing'};const g=ownedCourse(s,actor,x.course_id);return g.error?g:{...g,session:x}; }
+const liveAlert=(s,x,kind,title)=>notifyLearners(s,x.course_id,{event:`live-${kind}-${x.id}-${x.join_generation}`,type:'live_'+kind,title,body:structuredClone(x.title),href:`#/student/course/${x.course_id}?tab=live`});
+function conversationGuard(s,actor,id,capability,can) {
+ const q=s.conversations.find(x=>x.id===id);if(!q)return {error:'missing'};
+ if(!actor.user_id||!can(capability,q))return {error:'resourceDenied'};
+ return {conversation:q,course:s.courses.find(c=>c.id===q.course_id)};
+}
+// Active members of the owner's team holding reply_conversation on this exact course.
+function replyMembers(s,courseId) {
+ const c=s.courses.find(x=>x.id===courseId);if(!c)return [];
+ return s.teacher_team_members.filter(m=>m.teacher_id===c.owner_teacher_id&&m.status==='active'&&(!m.expires_at||m.expires_at>DEMO_NOW)&&s.course_team_assignments.some(a=>a.team_member_id===m.id&&a.course_id===courseId&&a.status==='active'&&a.capabilities.includes('reply_conversation'))).map(m=>({member_id:m.id,user_id:m.user_id,name:userName(s,m.user_id)}));
+}
+function postMessage(s,q,actor,body,internal) {
+ const m={id:nextId(s.messages,'MSG'),conversation_id:q.id,author_user_id:actor.user_id,text:body,lang:s.preferences.lang,internal,moderation_state:'visible',created_at:DEMO_NOW,updated_at:DEMO_NOW};
+ s.messages.push(m);if(!internal)q.last_message_at=DEMO_NOW;q.updated_at=DEMO_NOW;return m;
+}
+function teamMember(s,actor,memberId) { const teacher=teacherOf(s,actor);if(!teacher)return {error:'p6.teacherOnly'};const m=s.teacher_team_members.find(x=>x.id===memberId);if(!m)return {error:'missing'};return m.teacher_id===teacher.id?{teacher,member:m}:{error:'resourceDenied'}; }
+const ownedIds=(s,teacher)=>new Set(s.courses.filter(c=>c.owner_teacher_id===teacher.id).map(c=>c.id));
+const courseTitleOf=(s,id)=>editView(s.courses.find(c=>c.id===id)).title;
+function learnerRows(s,courseIds) {
+ return s.enrollments.filter(x=>courseIds.has(x.course_id)).map(e=>{
+  const st=s.students.find(x=>x.id===e.student_id),total=lessonsIn(s,e.course_id).length,progress=ownProgress(s,st.id,e.course_id),done=progress.filter(p=>p.status==='done').length;
+  return {id:`${st.id}:${e.course_id}`,student:{id:st.id,name:st.name,grade:s.grades.find(g=>g.id===st.current_grade_id)??null},course_id:e.course_id,course_title:courseTitleOf(s,e.course_id),enrollment:{id:e.id,status:e.status,started_at:e.started_at},access:accessOf(s,st.id,e.course_id).state,done,total,percent:percentOf(done,total),last_activity:progress.map(p=>p.updated_at).sort().at(-1)??null};
+ }).sort((a,b)=>a.student.id.localeCompare(b.student.id)||a.course_id.localeCompare(b.course_id));
+}
+// Teacher balances come only from ledger accounts; allocations are shown alongside so both reconcile.
+function teacherLedger(s,teacherId) {
+ const rows=s.financial_ledger_entries.filter(e=>e.teacher_id===teacherId),journals=new Map();
+ for(const e of rows){if(!journals.has(e.journal_id))journals.set(e.journal_id,[]);journals.get(e.journal_id).push(e);}
+ const sum=(list,account,side)=>list.filter(e=>e.account===account).reduce((n,e)=>n+e[side],0),bal=account=>sum(rows,account,'credit_baisa')-sum(rows,account,'debit_baisa');
+ const sales=[...journals.values()].filter(j=>j.some(e=>e.source_type==='order_item'&&e.account==='teacher_pending'&&e.credit_baisa>0)).flat();
+ const paid=[...journals.values()].filter(j=>j.some(e=>e.account==='provider_clearing'&&e.credit_baisa>0)&&j.some(e=>e.account==='teacher_in_payout'&&e.debit_baisa>0)).flat();
+ return {gross:sum(sales,'provider_clearing','debit_baisa'),commission:sum(sales,'platform_commission','credit_baisa'),teacher_share:sum(sales,'teacher_pending','credit_baisa'),
+  pending:bal('teacher_pending'),available:bal('teacher_available'),reserved:bal('teacher_reserved'),in_payout:bal('teacher_in_payout'),paid:sum(paid,'teacher_in_payout','debit_baisa'),
+  recoverable:sum(rows,'teacher_recovery','debit_baisa')-sum(rows,'teacher_recovery','credit_baisa'),entries:rows.length,journals:journals.size};
+}
+function weekBuckets(events) {
+ const now=Date.parse(DEMO_NOW);
+ return [3,2,1,0].map(i=>{const end=now-i*7*DAY,start=end-7*DAY,hit=events.filter(([,at])=>{const time=Date.parse(at);return time>start&&time<=end;});return {end:new Date(end).toISOString(),sales:hit.filter(e=>e[0]==='sale').length,lessons:hit.filter(e=>e[0]==='lesson').length,questions:hit.filter(e=>e[0]==='question').length};});
+}
+function teacherCourseCard(s,c) {
+ const v=editView(c),gs=s.grade_subjects.find(x=>x.id===v.grade_subject_id);
+ return {...v,status:c.status,grade:s.grades.find(g=>g.id===gs?.grade_id)??null,subject:s.subjects.find(x=>x.id===gs?.subject_id)??null,teacher:s.teachers.find(x=>x.id===c.owner_teacher_id),
+  revision:c.pending_revision?{status:c.pending_revision.status,feedback:c.pending_revision.feedback??null,fields:Object.keys(c.pending_revision.fields)}:null,unpublish_request:c.unpublish_request??null,
+  feedback:c.status==='ChangesRequested'||c.pending_revision?.status==='ChangesRequested'?(c.pending_revision?.feedback??c.review_feedback):null,
+  live_title:c.title,learners:entitled(s,c.id).length,lessons:lessonsIn(s,c.id).length,public:isPublic(s,c)};
+}
+function editorView(s,{id},{actor}) {
+ const teacher=teacherOf(s,actor);if(!teacher)return {status:'denied'};
+ const pairs=[...qualifiedPairs(s,teacher.id)].map(gid=>{const gs=s.grade_subjects.find(g=>g.id===gid);return {...gs,grade:s.grades.find(g=>g.id===gs.grade_id),subject:s.subjects.find(x=>x.id===gs.subject_id)};}).sort((a,b)=>a.grade.number-b.grade.number||a.subject_id.localeCompare(b.subject_id));
+ const options={pairs,versions:s.curriculum_versions,years:s.academic_years,semesters:s.semesters};
+ if(!id)return {status:'ok',isNew:true,teacher,course:{...(s.transient.courseDraft??{}),status:'Draft'},modules:[],quizzes:[],assignments:[],sessions:[],checklist:[],locked:null,contentLocked:null,...options};
+ const g=ownedCourse(s,actor,id);if(g.error)return {status:g.error==='missing'?'missing':'denied'};
+ const c=g.course,v=editView(c),gs=s.grade_subjects.find(x=>x.id===v.grade_subject_id);
+ return {status:'ok',isNew:false,teacher,course:{...teacherCourseCard(s,c),curriculum_version_id:gs?.curriculum_version_id??null},raw:c,
+  modules:s.modules.filter(m=>m.course_id===c.id).sort(byPosition).map(m=>({...m,lessons:s.lessons.filter(l=>l.module_id===m.id).sort(byPosition)})),
+  quizzes:s.quizzes.filter(q=>q.course_id===c.id).map(q=>({...q,lesson:s.lessons.find(l=>l.id===q.lesson_id),questions:q.question_ids.map(x=>s.questions.find(y=>y.id===x)).filter(Boolean),attempts:s.attempts.filter(a=>a.quiz_id===q.id).length})),
+  assignments:s.assignments.filter(a=>a.course_id===c.id).map(a=>({...a,lesson:s.lessons.find(l=>l.id===a.lesson_id),submissions:s.submissions.filter(x=>x.assignment_id===a.id).length})),
+  sessions:s.live_sessions.filter(x=>x.course_id===c.id).sort((a,b)=>a.starts_at.localeCompare(b.starts_at)),
+  checklist:courseChecklist(s,c),locked:metaLock(c),contentLocked:contentLock(c),...options};
+}
+function workspaceView(s,a,ctx) {
+ const d=editorView(s,a,ctx);if(d.status!=='ok'||d.isNew)return d;
+ const c=d.raw,lessons=d.modules.flatMap(m=>m.lessons),ids=new Set(lessons.map(l=>l.id)),learners=learnerRows(s,new Set([c.id])),recordings=s.recordings.filter(r=>r.course_id===c.id);
+ const submissions=s.submissions.filter(x=>d.assignments.some(a=>a.id===x.assignment_id)).map(x=>{const st=s.students.find(y=>y.id===x.student_id);return {...x,assignment:d.assignments.find(a=>a.id===x.assignment_id),student:{id:st.id,name:st.name},grade:s.assessment_grades.find(g=>g.submission_id===x.id)??null};}).sort((a,b)=>(a.state==='released')-(b.state==='released')||a.submitted_at.localeCompare(b.submitted_at));
+ const completions=lessons.filter(l=>l.state==='published').map(l=>({id:l.id,title:l.title,done:s.lesson_progress.filter(p=>p.lesson_id===l.id&&p.status==='done').length,started:s.lesson_progress.filter(p=>p.lesson_id===l.id).length}));
+ return {...d,learners,submissions,
+  resources:s.lesson_resources.filter(r=>ids.has(r.lesson_id)).map(r=>({...r,lesson:lessons.find(l=>l.id===r.lesson_id)})),
+  sessions:d.sessions.map(x=>({...x,recording:recordings.find(r=>r.live_session_id===x.id)??null,attendance:s.attendance.filter(t=>t.live_session_id===x.id&&t.status==='present').length})),
+  conversations:s.conversations.filter(q=>q.course_id===c.id).sort((a,b)=>b.last_message_at.localeCompare(a.last_message_at)).map(q=>({...q,student_name:s.students.find(x=>x.id===q.student_id)?.name??null,assignee:userName(s,q.assigned_user_id)})),
+  announcements:s.announcements.filter(x=>x.course_id===c.id).sort((a,b)=>b.published_at.localeCompare(a.published_at)),
+  history:s.audit_events.filter(e=>e.resource_type==='course'&&e.resource_id===c.id).sort((a,b)=>b.created_at.localeCompare(a.created_at)).map(e=>({...e,actor:userName(s,e.actor_user_id)})),
+  team:s.teacher_team_members.filter(m=>m.teacher_id===c.owner_teacher_id&&m.status==='active').map(m=>({member_id:m.id,name:userName(s,m.user_id),capabilities:s.course_team_assignments.find(x=>x.team_member_id===m.id&&x.course_id===c.id&&x.status==='active')?.capabilities??[]})).filter(m=>m.capabilities.length),
+  analytics:{completions,active:learners.filter(r=>r.access==='active').length,average:learners.length?Math.round(learners.reduce((n,r)=>n+r.percent,0)/learners.length):0,questions:s.conversations.filter(q=>q.course_id===c.id).length,attempts:s.attempts.filter(x=>d.quizzes.some(q=>q.id===x.quiz_id)).length}};
+}
+function threadView(s,{id},{actor}) {
+ const teacher=teacherOf(s,actor);if(!teacher)return {status:'denied'};
+ const q=s.conversations.find(x=>x.id===id);if(!q)return {status:'missing'};
+ const c=s.courses.find(x=>x.id===q.course_id);if(c?.owner_teacher_id!==teacher.id)return {status:'denied'};
+ const st=s.students.find(x=>x.id===q.student_id);
+ const author=uid=>uid===st?.user_id?'student':s.teachers.some(x=>x.user_id===uid)?'teacher':s.teacher_team_members.some(x=>x.user_id===uid)?'assistant':'staff';
+ return {status:'ok',conversation:q,course:teacherCourseCard(s,c),lesson:s.lessons.find(l=>l.id===q.lesson_id)??null,student:{id:st.id,name:st.name},
+  messages:s.messages.filter(m=>m.conversation_id===q.id&&m.moderation_state!=='removed').sort((a,b)=>a.created_at.localeCompare(b.created_at)).map(m=>({...m,author_role:author(m.author_user_id),author_name:userName(s,m.author_user_id),own:m.author_user_id===actor.user_id})),
+  assignee:userName(s,q.assigned_user_id),members:replyMembers(s,c.id),next:(CONVERSATION_NEXT[q.state]??[]).filter(x=>x!=='assigned'||q.assigned_user_id),
+  reported:new Set(s.safety_reports.filter(r=>r.reporter_user_id===actor.user_id).map(r=>r.message_id??'conversation:'+r.conversation_id)),
+  trail:[...s.conversation_assignments.filter(x=>x.conversation_id===q.id).map(x=>({id:x.id,at:x.created_at,action:'conversation.assign',actor:userName(s,x.assigned_by),detail:userName(s,x.assignee_user_id),status:x.status})),...s.audit_events.filter(e=>e.resource_type==='conversation'&&e.resource_id===q.id&&e.action!=='conversation.assign').map(e=>({id:e.id,at:e.created_at,action:e.action,actor:userName(s,e.actor_user_id),detail:e.after_summary,status:null}))].sort((a,b)=>b.at.localeCompare(a.at))};
+}
+registerSelectors({
+ 'teacher.me':(s,_a,{actor})=>{const teacher=teacherOf(s,actor);return teacher?{teacher,user:s.users.find(u=>u.id===teacher.user_id)}:null;},
+ 'teacher.dashboard':(s,_a,{actor})=>{
+  const teacher=teacherOf(s,actor);if(!teacher)return null;
+  const owned=s.courses.filter(c=>c.owner_teacher_id===teacher.id),ids=new Set(owned.map(c=>c.id)),convs=s.conversations.filter(q=>ids.has(q.course_id));
+  const items=s.order_items.filter(i=>i.owner_teacher_id_snapshot===teacher.id&&s.earning_allocations.some(a=>a.order_item_id===i.id));
+  const events=[...items.map(i=>['sale',i.created_at]),...s.lesson_progress.filter(p=>p.status==='done'&&ids.has(lessonCourse(s,s.lessons.find(l=>l.id===p.lesson_id)))).map(p=>['lesson',p.completed_at]),...convs.map(q=>['question',q.created_at])];
+  return {teacher,counts:Object.fromEntries(COURSE_STATES.map(k=>[k,owned.filter(c=>c.status===k).length])),total:owned.length,
+   learners:new Set(owned.flatMap(c=>entitled(s,c.id).map(st=>st.id))).size,
+   queue:Object.fromEntries(['open','assigned','waiting','escalated','resolved'].map(k=>[k,convs.filter(q=>q.state===k).length])),
+   attention:convs.filter(q=>['open','escalated'].includes(q.state)).sort((a,b)=>b.last_message_at.localeCompare(a.last_message_at)).slice(0,5).map(q=>({...q,course_title:courseTitleOf(s,q.course_id)})),
+   ledger:teacherLedger(s,teacher.id),weeks:weekBuckets(events),
+   feedback:owned.filter(c=>c.status==='ChangesRequested'||c.pending_revision?.status==='ChangesRequested').map(c=>teacherCourseCard(s,c)),
+   upcoming:s.live_sessions.filter(x=>ids.has(x.course_id)&&JOINABLE.includes(x.status)&&x.ends_at>DEMO_NOW).sort((a,b)=>a.starts_at.localeCompare(b.starts_at)).slice(0,3).map(x=>({...x,course_title:courseTitleOf(s,x.course_id)}))};
+ },
+ 'teacher.courses':(s,_a,{actor})=>{const teacher=teacherOf(s,actor);return teacher?s.courses.filter(c=>c.owner_teacher_id===teacher.id).map(c=>teacherCourseCard(s,c)):[];},
+ 'teacher.editor':editorView,'teacher.workspace':workspaceView,'teacher.thread':threadView,
+ 'teacher.form':(s,{name})=>s.transient.teacherForms?.[name]??{values:{},fieldErrors:{}},
+ 'teacher.students':(s,{courseId},{actor})=>{const teacher=teacherOf(s,actor);if(!teacher)return null;const ids=ownedIds(s,teacher),scoped=courseId&&ids.has(courseId)?courseId:null;return {courses:s.courses.filter(c=>ids.has(c.id)).map(c=>({id:c.id,title:editView(c).title})),rows:learnerRows(s,scoped?new Set([scoped]):ids),courseId:scoped};},
+ // A learner record is visible only through an enrollment in an owned course; no guardian data is attached.
+ 'teacher.student':(s,{id},{actor})=>{
+  const teacher=teacherOf(s,actor);if(!teacher)return {status:'denied'};const st=s.students.find(x=>x.id===id);if(!st)return {status:'missing'};
+  const ids=new Set([...ownedIds(s,teacher)].filter(cid=>s.enrollments.some(e=>e.student_id===st.id&&e.course_id===cid)));if(!ids.size)return {status:'denied'};
+  return {status:'ok',student:{id:st.id,name:st.name,grade:s.grades.find(g=>g.id===st.current_grade_id)??null},rows:learnerRows(s,ids).filter(r=>r.student.id===st.id).map(r=>({...r,
+   quizzes:s.quizzes.filter(q=>q.course_id===r.course_id).map(q=>{const at=s.attempts.filter(x=>x.quiz_id===q.id&&x.student_id===st.id);return {id:q.id,title:q.title,attempts:at.length,best:at.length?Math.max(...at.map(x=>x.score)):null};}),
+   assignments:s.assignments.filter(a=>a.course_id===r.course_id).map(a=>{const sub=s.submissions.find(x=>x.assignment_id===a.id&&x.student_id===st.id),grade=sub?s.assessment_grades.find(g=>g.submission_id===sub.id):null;return {id:a.id,title:a.title,max_score:a.max_score,state:!sub?'not_submitted':grade?.released_at?'released':grade?'graded':'submitted',score:grade?.score??null};})}))};
+ },
+ 'teacher.inbox':(s,{status},{actor})=>{
+  const teacher=teacherOf(s,actor);if(!teacher)return null;const ids=ownedIds(s,teacher);
+  const all=s.conversations.filter(q=>ids.has(q.course_id)).sort((a,b)=>b.last_message_at.localeCompare(a.last_message_at)).map(q=>{const last=s.messages.filter(m=>m.conversation_id===q.id&&!m.internal&&m.moderation_state!=='removed').sort((a,b)=>a.created_at.localeCompare(b.created_at)).at(-1);return {...q,course_title:courseTitleOf(s,q.course_id),student_name:s.students.find(x=>x.id===q.student_id)?.name??null,assignee:userName(s,q.assigned_user_id),last_text:last?.text??'',members:replyMembers(s,q.course_id)};});
+  return {all,rows:status?all.filter(q=>q.state===status):all,counts:Object.fromEntries(['open','assigned','waiting','escalated','resolved'].map(k=>[k,all.filter(q=>q.state===k).length]))};
+ },
+ 'teacher.calendar':(s,_a,{actor})=>{const teacher=teacherOf(s,actor);if(!teacher)return null;const ids=ownedIds(s,teacher);return {courses:s.courses.filter(c=>ids.has(c.id)&&c.status!=='Archived').map(c=>({id:c.id,title:editView(c).title})),sessions:s.live_sessions.filter(x=>ids.has(x.course_id)&&x.status!=='draft').sort((a,b)=>a.starts_at.localeCompare(b.starts_at)).map(x=>({...x,course_title:courseTitleOf(s,x.course_id)}))};},
+ 'teacher.team':(s,_a,{actor})=>{
+  const teacher=teacherOf(s,actor);if(!teacher)return null;const ids=ownedIds(s,teacher);
+  const rows=s.teacher_team_members.filter(m=>m.teacher_id===teacher.id).map(m=>({...m,user:s.users.find(u=>u.id===m.user_id),expired:!!m.expires_at&&m.expires_at<=DEMO_NOW,assignments:s.course_team_assignments.filter(a=>a.team_member_id===m.id&&a.status==='active'&&ids.has(a.course_id)).map(a=>({...a,course_title:courseTitleOf(s,a.course_id)}))}));
+  return {members:rows.filter(m=>m.status==='active'),invitations:rows.filter(m=>m.status==='invited'),former:rows.filter(m=>!['active','invited'].includes(m.status)),courses:s.courses.filter(c=>ids.has(c.id)&&c.status!=='Archived').map(c=>({id:c.id,title:editView(c).title,status:c.status}))};
+ },
+ 'teacher.earnings':(s,_a,{actor})=>{
+  const teacher=teacherOf(s,actor);if(!teacher)return null;
+  const allocations=s.earning_allocations.filter(a=>a.teacher_id===teacher.id),items=s.order_items.filter(i=>i.owner_teacher_id_snapshot===teacher.id&&allocations.some(a=>a.order_item_id===i.id));
+  const sales=items.map(i=>({...i,order_state:s.orders.find(o=>o.id===i.order_id)?.state,allocation:allocations.find(a=>a.order_item_id===i.id&&!a.original_allocation_id)??null,refund:s.refunds.find(r=>r.order_item_id===i.id)??null})).sort((a,b)=>b.created_at.localeCompare(a.created_at));
+  const linked=a=>({original:a,item:items.find(i=>i.id===a?.order_item_id)??null});
+  const adjustments=[...s.adjustments.filter(x=>allocations.some(a=>a.id===x.original_allocation_id)).map(x=>({id:x.id,signed_amount_baisa:x.signed_amount_baisa,reason:x.reason,created_at:x.created_at,...linked(allocations.find(a=>a.id===x.original_allocation_id))})),
+   ...allocations.filter(a=>a.original_allocation_id&&!s.adjustments.some(x=>x.original_allocation_id===a.original_allocation_id)).map(a=>({id:a.id,signed_amount_baisa:a.amount_baisa,reason:null,created_at:a.created_at,...linked(allocations.find(x=>x.id===a.original_allocation_id))}))].sort((a,b)=>b.created_at.localeCompare(a.created_at));
+  const byState=Object.fromEntries(EARNING_STATES.map(k=>[k,allocations.filter(a=>a.state===k).reduce((n,a)=>n+a.amount_baisa,0)]));
+  const payouts=s.teacher_payouts.filter(p=>p.teacher_id===teacher.id).map(p=>{const b=s.payout_batches.find(x=>x.id===p.batch_id);return {...p,batch:{id:b.id,state:b.state,period_label:b.period_label,submitted_at:b.submitted_at,approved_at:b.approved_at,failure_reason:b.failure_reason,destination:b.destination_snapshots.find(d=>d.teacher_id===teacher.id)??null}};}).sort((a,b)=>b.created_at.localeCompare(a.created_at));
+  return {teacher,ledger:teacherLedger(s,teacher.id),sales,allocations,adjustments,byState,payouts,account:s.teacher_payout_accounts.find(a=>a.teacher_id===teacher.id)??null};
+ },
+ 'teacher.settings':(s,_a,{actor})=>{
+  const teacher=teacherOf(s,actor);if(!teacher)return null;const held=s.teacher_grade_subjects.filter(q=>q.teacher_id===teacher.id);
+  const pair=id=>{const gs=s.grade_subjects.find(g=>g.id===id);return {id,grade:s.grades.find(g=>g.id===gs.grade_id),subject:s.subjects.find(x=>x.id===gs.subject_id),display_name:gs.display_name};};
+  return {teacher,user:s.users.find(u=>u.id===teacher.user_id),prefs:Object.fromEntries(TEACHER_PREFS.map(k=>[k,teacher.notification_prefs?.[k]??true])),
+   verified:held.filter(q=>q.verification_state==='verified').map(q=>pair(q.grade_subject_id)).sort((a,b)=>a.grade.number-b.grade.number),pending:held.filter(q=>q.verification_state!=='verified').map(q=>({...pair(q.grade_subject_id),state:q.verification_state,requested_at:q.created_at})),
+   requestable:s.grade_subjects.filter(g=>g.active&&!held.some(q=>q.grade_subject_id===g.id)).map(g=>pair(g.id)).sort((a,b)=>a.grade.number-b.grade.number)};
+ },
+});
+Object.assign(reducers,{
+ // Transient wizard/form state so inline validation survives rerenders (teacher-authored strings only).
+ 'teacher.saveForm':(s,p,{actor})=>{
+  if(!teacherOf(s,actor)||typeof p.name!=='string'||!/^[\w:-]{1,60}$/.test(p.name))return fail('invalidAction');
+  const values=Object.fromEntries(Object.entries(p.values??{}).filter(([k,v])=>/^\w{1,40}$/.test(k)&&typeof v==='string').map(([k,v])=>[k,v.slice(0,4000)]));
+  const fieldErrors=Object.fromEntries(Object.entries(p.fieldErrors??{}).filter(([k,v])=>/^\w{1,40}$/.test(k)&&typeof v==='string'&&/^(?:error|p4|p6)\.\w+$/.test(v)));
+  (s.transient.teacherForms??={})[p.name]={values,fieldErrors};return ok(null);
+ },
+ 'teacher.clearForm':(s,p)=>{ if(s.transient.teacherForms&&typeof p.name==='string')delete s.transient.teacherForms[p.name];return ok(null); },
+ // Wizard save. A new course is created (Draft, generated ID) once identity and academics are both valid;
+ // a Published course keeps its live fields and stores the edit as pending_revision.
+ 'course.saveDraft':(s,p,{actor})=>{
+  const teacher=teacherOf(s,actor);if(!teacher)return fail('p6.teacherOnly');
+  if(!['identity','academics','access'].includes(p.step))return fail('invalidAction');
+  let course=null;
+  if(p.courseId){const g=ownedCourse(s,actor,p.courseId);if(g.error)return fail(g.error);course=g.course;const lock=metaLock(course);if(lock)return fail(lock);}
+  const {values,errors}=validateCourseStep(s,teacher,p.step,p.values??{});
+  if(Object.keys(errors).length)return failFields(errors,'error.form',{step:p.step});
+  if(!course) {
+   if(p.step==='access')return fail('p6.saveFirst');
+   const draft={...(s.transient.courseDraft??{}),...values};
+   if(!draft.title||!draft.grade_subject_id){s.transient.courseDraft=draft;return ok({id:null,created:false,next:draft.title?'academics':'identity'});}
+   const id=nextId(s.courses,'C');
+   course={id,owner_teacher_id:teacher.id,grade_subject_id:draft.grade_subject_id,academic_year_id:draft.academic_year_id,semester_id:draft.semester_id,track_id:draft.track_id,title:draft.title,summary:draft.summary,description:draft.description,outcomes:draft.outcomes,prerequisites:draft.prerequisites,language:draft.language,mode:draft.mode,status:'Draft',price_type:'free',price_baisa:0,access_policy:{kind:'academic_year',end_at:ACCESS_END},
+    support_summary:{ar:'أسئلة الدروس داخل الدورة بإشراف المعلم.',en:'Teacher-moderated lesson Q&A inside the course.'},cover_seed:s.courses.length+1,published_snapshot:null,pending_revision:null,review_feedback:{ar:'',en:''},created_at:DEMO_NOW,updated_at:DEMO_NOW};
+   s.courses.push(course);s.modules.push({id:nextId(s.modules,'MOD'),course_id:id,title:{ar:'الوحدة الأولى',en:'Module 1'},position:1,created_at:DEMO_NOW,updated_at:DEMO_NOW});
+   delete s.transient.courseDraft;audit(s,actor,'course.create','course',id,'','Draft');
+   return ok({id,created:true});
+  }
+  if(course.status==='Published') {
+   const prev=course.pending_revision;
+   course.pending_revision={status:prev?.status==='ChangesRequested'?'ChangesRequested':'Draft',fields:{...(prev?.fields??{}),...structuredClone(values)},feedback:prev?.feedback??null,started_at:prev?.started_at??DEMO_NOW,updated_at:DEMO_NOW};
+   if(!prev)audit(s,actor,'course.start_revision','course',course.id,'Published','pending_revision');
+   return ok({id:course.id,created:false,revision:true});
+  }
+  Object.assign(course,structuredClone(values),{updated_at:DEMO_NOW});return ok({id:course.id,created:false,revision:false});
+ },
+ 'course.requestRevision':(s,p,{actor})=>{
+  const g=ownedCourse(s,actor,p.courseId);if(g.error)return fail(g.error);
+  if(g.course.status!=='Published')return fail('p6.invalidTransition');
+  if(g.course.pending_revision)return ok({id:g.course.id,existing:true});
+  g.course.pending_revision={status:'Draft',fields:{},feedback:null,started_at:DEMO_NOW,updated_at:DEMO_NOW};
+  audit(s,actor,'course.start_revision','course',g.course.id,'Published','pending_revision');return ok({id:g.course.id,existing:false});
+ },
+ 'course.submit':(s,p,{actor})=>{
+  const g=ownedCourse(s,actor,p.courseId);if(g.error)return fail(g.error);const c=g.course,rev=c.pending_revision;
+  if(c.status==='Submitted'||rev?.status==='Submitted')return ok({id:c.id,existing:true});
+  const fresh=['Draft','ChangesRequested'].includes(c.status),revision=c.status==='Published'&&!!rev&&['Draft','ChangesRequested'].includes(rev.status);
+  if(!fresh&&!revision)return fail('p6.invalidTransition');
+  if(checklistBlocked(s,c))return fail('p6.checklistIncomplete');
+  const before=revision?'revision:'+rev.status:c.status;
+  if(revision)Object.assign(rev,{status:'Submitted',submitted_at:DEMO_NOW,updated_at:DEMO_NOW});else Object.assign(c,{status:'Submitted',updated_at:DEMO_NOW});
+  audit(s,actor,'course.submit','course',c.id,before,revision?'revision:Submitted':'Submitted');
+  for(const m of moderators(s))notifyUser(s,m,{event:`course-submitted-${c.id}-${s.audit_events.length}`,type:'course_review',title:{ar:'دورة بانتظار المراجعة',en:'Course awaiting review'},body:structuredClone(editView(c).title),href:'#/admin/courses/review',courseId:c.id});
+  return ok({id:c.id,existing:false,revision});
+ },
+ // Staff-only moderation decision (the review queue UI lands in P8). Approval re-validates the owner's
+ // verified qualifications, so a forged classification can never be published.
+ 'course.review':(s,p,{actor,can})=>{
+  if(!can('courses.moderate',{module:'courses'}))return fail('resourceDenied');
+  const c=s.courses.find(x=>x.id===p.courseId);if(!c)return fail('missing');
+  const revision=c.status==='Published'&&c.pending_revision?.status==='Submitted';
+  if(c.status!=='Submitted'&&!revision)return fail('p6.invalidTransition');
+  const owner=s.teachers.find(x=>x.id===c.owner_teacher_id),before=revision?'revision:Submitted':'Submitted';
+  const note={event:`course-review-${c.id}-${s.audit_events.length}`,href:`#/teacher/course/${c.id}?tab=details`,courseId:c.id,body:structuredClone(editView(c).title)};
+  if(p.decision==='requestChanges') {
+   const feedback=text(p.feedback,1000),error=feedback&&feedback.length<10?'error.messageShort':lengthError(feedback,10);if(error)return failFields({feedback:error});
+   if(revision)Object.assign(c.pending_revision,{status:'ChangesRequested',feedback:typed(feedback),updated_at:DEMO_NOW});else c.status='ChangesRequested';
+   Object.assign(c,{review_feedback:typed(feedback),updated_at:DEMO_NOW});audit(s,actor,'course.request_changes','course',c.id,before,revision?'revision:ChangesRequested':'ChangesRequested',feedback);
+   notifyUser(s,owner?.user_id,{...note,type:'review_feedback',title:{ar:'تعديلات مطلوبة على دورتك',en:'Changes requested on your course'}});
+   return ok({id:c.id,status:c.status});
+  }
+  if(p.decision!=='approve')return fail('invalidAction');
+  if(!qualifiedPairs(s,c.owner_teacher_id).has(editView(c).grade_subject_id))return fail('p6.notQualified');
+  if(checklistBlocked(s,c))return fail('p6.checklistIncomplete');
+  if(revision)Object.assign(c,structuredClone(c.pending_revision.fields));
+  else { c.status='Published';for(const l of s.lessons.filter(l=>l.state==='ready'&&s.modules.some(m=>m.id===l.module_id&&m.course_id===c.id)))Object.assign(l,{state:'published',updated_at:DEMO_NOW}); }
+  Object.assign(c,{published_snapshot:snapshotOf(c),pending_revision:null,review_feedback:{ar:'',en:''},updated_at:DEMO_NOW});
+  audit(s,actor,'course.approve','course',c.id,before,'Published',text(p.feedback,1000)||'Checklist complete');
+  notifyUser(s,owner?.user_id,{...note,type:'review_approved',title:{ar:'تم اعتماد دورتك',en:'Your course was approved'}});
+  return ok({id:c.id,status:'Published'});
+ },
+ 'course.requestUnpublish':(s,p,{actor})=>{
+  const g=ownedCourse(s,actor,p.courseId);if(g.error)return fail(g.error);const c=g.course;
+  if(c.status!=='Published')return fail('p6.invalidTransition');
+  if(c.unpublish_request)return ok({id:c.id,existing:true});
+  const reason=text(p.reason,600),error=reason&&reason.length<10?'error.messageShort':lengthError(reason,10);if(error)return failFields({reason:error});
+  c.unpublish_request={state:'requested',reason:typed(reason),requested_at:DEMO_NOW};c.updated_at=DEMO_NOW;
+  audit(s,actor,'course.request_unpublish','course',c.id,'Published','unpublish_requested',reason);
+  for(const m of moderators(s))notifyUser(s,m,{event:'course-unpublish-'+c.id,type:'course_review',title:{ar:'طلب إلغاء نشر دورة',en:'Course unpublish request'},body:structuredClone(c.title),href:'#/admin/courses/catalog',courseId:c.id});
+  return ok({id:c.id,existing:false});
+ },
+ 'module.add':(s,p,{actor})=>{
+  const g=ownedCourse(s,actor,p.courseId);if(g.error)return fail(g.error);const lock=contentLock(g.course);if(lock)return fail(lock);
+  const r=pairText({ar:p.title_ar,en:p.title_en},3,120),errors=pick({title_ar:r.errors.ar,title_en:r.errors.en});if(Object.keys(errors).length)return failFields(errors);
+  const m={id:nextId(s.modules,'MOD'),course_id:g.course.id,title:r.value,position:Math.max(0,...s.modules.filter(x=>x.course_id===g.course.id).map(x=>x.position))+1,created_at:DEMO_NOW,updated_at:DEMO_NOW};
+  s.modules.push(m);return ok({moduleId:m.id});
+ },
+ 'lesson.add':(s,p,{actor})=>{
+  const g=ownedCourse(s,actor,p.courseId);if(g.error)return fail(g.error);const lock=contentLock(g.course);if(lock)return fail(lock);
+  const module=s.modules.find(m=>m.id===p.moduleId&&m.course_id===g.course.id);
+  const {values,errors}=lessonFields(p,false,p.type);if(!module)errors.moduleId='error.required';if(Object.keys(errors).length)return failFields(errors);
+  const lesson=newLesson(s,module,values);publishLessonAlert(s,g.course,lesson);g.course.updated_at=DEMO_NOW;return ok({lessonId:lesson.id});
+ },
+ 'lesson.update':(s,p,{actor})=>{
+  const g=lessonGuardTeacher(s,actor,p.lessonId);if(g.error)return fail(g.error);const lock=contentLock(g.course);if(lock)return fail(lock);
+  const fields=Object.fromEntries(Object.entries(p).filter(([k])=>['title_ar','title_en','duration','state','preview','body'].includes(k)));
+  if(!Object.keys(fields).length)return fail('invalidAction');
+  const {values,errors}=lessonFields(fields,true,g.lesson.type);if(Object.keys(errors).length)return failFields(errors);
+  const was=g.lesson.state;Object.assign(g.lesson,values,{updated_at:DEMO_NOW});
+  if(values.body&&g.lesson.type==='video')g.lesson.transcript=structuredClone(values.body);
+  if(was!=='published')publishLessonAlert(s,g.course,g.lesson);return ok({lessonId:g.lesson.id});
+ },
+ 'lesson.move':(s,p,{actor})=>{
+  const g=lessonGuardTeacher(s,actor,p.lessonId);if(g.error)return fail(g.error);const lock=contentLock(g.course);if(lock)return fail(lock);
+  const siblings=s.lessons.filter(l=>l.module_id===g.lesson.module_id).sort(byPosition),i=siblings.indexOf(g.lesson),j=p.direction==='up'?i-1:p.direction==='down'?i+1:-1;
+  if(j<0||j>=siblings.length)return fail('p6.cannotMove');
+  const other=siblings[j];[g.lesson.position,other.position]=[other.position,g.lesson.position];g.lesson.updated_at=other.updated_at=DEMO_NOW;
+  return ok({lessonId:g.lesson.id,position:g.lesson.position});
+ },
+ 'quiz.create':(s,p,{actor})=>{
+  const g=ownedCourse(s,actor,p.courseId);if(g.error)return fail(g.error);const lock=contentLock(g.course);if(lock)return fail(lock);
+  const module=s.modules.find(m=>m.id===p.moduleId&&m.course_id===g.course.id);
+  const {values,errors}=quizFields(p);if(!module)errors.moduleId='error.required';if(Object.keys(errors).length)return failFields(errors);
+  const lesson=newLesson(s,module,{title:typed(values.title),type:'quiz',duration_seconds:600,state:'ready',preview:false,body:typed('')});
+  const id=nextId(s.quizzes,'QUIZ'),qids=values.questions.map(q=>{const qid=nextId(s.questions,'QUESTION');s.questions.push({id:qid,quiz_id:id,version:1,prompt:typed(q.prompt),choices:q.choices.map((c,i)=>({id:'abc'[i],text:typed(c)})),correct_choice_id:'abc'[q.correct],points:10,created_at:DEMO_NOW,updated_at:DEMO_NOW});return qid;});
+  s.quizzes.push({id,course_id:g.course.id,lesson_id:lesson.id,title:typed(values.title),pass_score:values.pass_score,attempt_limit:2,question_ids:qids,created_at:DEMO_NOW,updated_at:DEMO_NOW});
+  return ok({quizId:id,lessonId:lesson.id});
+ },
+ 'quiz.update':(s,p,{actor})=>{
+  const q=s.quizzes.find(x=>x.id===p.quizId);if(!q)return fail('missing');const g=ownedCourse(s,actor,q.course_id);if(g.error)return fail(g.error);const lock=contentLock(g.course);if(lock)return fail(lock);
+  const title=text(p.title,120),pass=intIn(p.pass_score,0,100),errors=pick({title:lengthError(title,3),pass_score:pass===null?'p6.passRange':null});if(Object.keys(errors).length)return failFields(errors);
+  Object.assign(q,{title:typed(title),pass_score:pass,updated_at:DEMO_NOW});Object.assign(s.lessons.find(l=>l.id===q.lesson_id),{title:typed(title),updated_at:DEMO_NOW});return ok({quizId:q.id});
+ },
+ 'assignment.create':(s,p,{actor})=>{
+  const g=ownedCourse(s,actor,p.courseId);if(g.error)return fail(g.error);const lock=contentLock(g.course);if(lock)return fail(lock);
+  const module=s.modules.find(m=>m.id===p.moduleId&&m.course_id===g.course.id);
+  const {values,errors}=assignmentFields(p);if(!module)errors.moduleId='error.required';if(Object.keys(errors).length)return failFields(errors);
+  const lesson=newLesson(s,module,{title:typed(values.title),type:'assignment',duration_seconds:900,state:'ready',preview:false,body:typed(values.instructions)});
+  const a={id:nextId(s.assignments,'ASG'),course_id:g.course.id,lesson_id:lesson.id,title:typed(values.title),instructions:typed(values.instructions),due_at:values.due_at,max_score:values.max_score,created_at:DEMO_NOW,updated_at:DEMO_NOW};
+  s.assignments.push(a);return ok({assignmentId:a.id,lessonId:lesson.id});
+ },
+ 'assignment.update':(s,p,{actor})=>{
+  const a=s.assignments.find(x=>x.id===p.assignmentId);if(!a)return fail('missing');const g=ownedCourse(s,actor,a.course_id);if(g.error)return fail(g.error);const lock=contentLock(g.course);if(lock)return fail(lock);
+  const {values,errors}=assignmentFields(p);if(Object.keys(errors).length)return failFields(errors);
+  Object.assign(a,{title:typed(values.title),instructions:typed(values.instructions),due_at:values.due_at,max_score:values.max_score,updated_at:DEMO_NOW});Object.assign(s.lessons.find(l=>l.id===a.lesson_id),{title:typed(values.title),body:typed(values.instructions),updated_at:DEMO_NOW});
+  return ok({assignmentId:a.id});
+ },
+ 'resource.add':(s,p,{actor})=>{
+  const g=lessonGuardTeacher(s,actor,p.lessonId);if(g.error)return g.error==='missing'?failFields({lessonId:'error.required'}):fail(g.error);const lock=contentLock(g.course);if(lock)return fail(lock);
+  const title=text(p.title,120),filename=text(p.filename,80).split(/[\\/]/).pop(),body=text(p.body,4000);
+  const errors=pick({title:lengthError(title,3),kind:['worksheet','pdf'].includes(p.kind)?null:'error.required',filename:!filename?'error.required':RESOURCE_FILE.test(filename)?null:'p6.resourceFileInvalid',body:body&&body.length<10?'error.messageShort':lengthError(body,10)});
+  if(Object.keys(errors).length)return failFields(errors);
+  const r={id:nextId(s.lesson_resources,'RES'),lesson_id:g.lesson.id,title:typed(title),kind:p.kind,filename,byte_size:new TextEncoder().encode(body).length,body:typed(body),created_at:DEMO_NOW,updated_at:DEMO_NOW};
+  s.lesson_resources.push(r);return ok({resourceId:r.id});
+ },
+ 'resource.update':(s,p,{actor})=>{
+  const r=s.lesson_resources.find(x=>x.id===p.resourceId);if(!r)return fail('missing');const g=lessonGuardTeacher(s,actor,r.lesson_id);if(g.error)return fail(g.error);const lock=contentLock(g.course);if(lock)return fail(lock);
+  const title=text(p.title,120),body=text(p.body,4000),errors=pick({title:lengthError(title,3),body:body&&body.length<10?'error.messageShort':lengthError(body,10)});if(Object.keys(errors).length)return failFields(errors);
+  Object.assign(r,{title:typed(title),body:typed(body),byte_size:new TextEncoder().encode(body).length,updated_at:DEMO_NOW});return ok({resourceId:r.id});
+ },
+ // Grading is capability-scoped (owner, or an assistant holding grade_assignment on this course).
+ 'submission.grade':(s,p,{actor,can})=>{
+  const sub=s.submissions.find(x=>x.id===p.submissionId);if(!sub)return fail('missing');const a=s.assignments.find(x=>x.id===sub.assignment_id),c=s.courses.find(x=>x.id===a.course_id);
+  if(!actor.user_id||!can('grade_assignment',c))return fail('resourceDenied');
+  if(sub.state==='released')return fail('p6.alreadyReleased');
+  const score=intIn(p.score,0,a.max_score),feedback=text(p.feedback,1000),errors=pick({score:score===null?'p6.scoreRange':null,feedback:lengthError(feedback,2)});if(Object.keys(errors).length)return failFields(errors);
+  let grade=s.assessment_grades.find(x=>x.submission_id===sub.id);
+  if(grade)Object.assign(grade,{grader_user_id:actor.user_id,score,feedback,updated_at:DEMO_NOW});
+  else {grade={id:nextId(s.assessment_grades,'GRADE'),submission_id:sub.id,grader_user_id:actor.user_id,score,feedback,released_at:null,created_at:DEMO_NOW,updated_at:DEMO_NOW};s.assessment_grades.push(grade);}
+  Object.assign(sub,{state:'graded',updated_at:DEMO_NOW});return ok({gradeId:grade.id});
+ },
+ 'submission.release':(s,p,{actor,can})=>{
+  const sub=s.submissions.find(x=>x.id===p.submissionId);if(!sub)return fail('missing');const a=s.assignments.find(x=>x.id===sub.assignment_id),c=s.courses.find(x=>x.id===a.course_id);
+  if(!actor.user_id||!can('grade_assignment',c))return fail('resourceDenied');
+  const grade=s.assessment_grades.find(x=>x.submission_id===sub.id);if(!grade)return fail('p6.gradeFirst');
+  if(grade.released_at)return ok({gradeId:grade.id,existing:true});
+  Object.assign(grade,{released_at:DEMO_NOW,updated_at:DEMO_NOW});Object.assign(sub,{state:'released',updated_at:DEMO_NOW});
+  const st=s.students.find(x=>x.id===sub.student_id);
+  notifyUser(s,st?.user_id,{event:'grade-released-'+grade.id,type:'grade_released',title:{ar:'نُشرت نتيجة مهمتك',en:'Your task result is released'},body:structuredClone(a.title),href:`#/student/course/${c.id}?tab=assessments&activity=${a.id}`,courseId:c.id});
+  audit(s,actor,'submission.release','submission',sub.id,'graded','released');
+  return ok({gradeId:grade.id,existing:false});
+ },
+ // Live lifecycle: one notification per entitled learner per event (join_generation keys reschedules).
+ 'live.schedule':(s,p,{actor})=>{
+  const g=ownedCourse(s,actor,p.courseId);if(g.error)return fail(g.error);if(g.course.status==='Archived')return fail('p6.lockedArchived');
+  const title=text(p.title,120),start=muscatToUtc(p.starts_at),minutes=intIn(p.duration,15,180);
+  const errors=pick({title:lengthError(title,3),starts_at:!start?'error.required':start<=DEMO_NOW?'p6.startFuture':null,duration:minutes===null?'p6.durationLive':null});if(Object.keys(errors).length)return failFields(errors);
+  const x={id:nextId(s.live_sessions,'LS'),course_id:g.course.id,host_teacher_id:g.teacher.id,title:typed(title),starts_at:start,ends_at:new Date(Date.parse(start)+minutes*60000).toISOString().replace('.000Z','Z'),timezone:'Asia/Muscat',status:'scheduled',provider_ref:'demo',join_generation:1,recording_disclosure:{ar:'قد تُسجَّل هذه الحصة التجريبية ليشاهدها المسجلون في الدورة فقط.',en:'This simulated class may be recorded for enrolled learners only.'},created_at:DEMO_NOW,updated_at:DEMO_NOW};
+  s.live_sessions.push(x);liveAlert(s,x,'scheduled',{ar:'حصة مباشرة جديدة',en:'New live class scheduled'});return ok({sessionId:x.id});
+ },
+ 'live.reschedule':(s,p,{actor})=>{
+  const g=sessionGuard(s,actor,p.sessionId);if(g.error)return fail(g.error);const x=g.session;
+  if(!['scheduled','rescheduled','failed'].includes(x.status))return fail('p6.invalidTransition');
+  const start=muscatToUtc(p.starts_at);if(!start||start<=DEMO_NOW)return failFields({starts_at:start?'p6.startFuture':'error.required'});
+  const length=Date.parse(x.ends_at)-Date.parse(x.starts_at);
+  Object.assign(x,{starts_at:start,ends_at:new Date(Date.parse(start)+length).toISOString().replace('.000Z','Z'),status:'rescheduled',join_generation:x.join_generation+1,updated_at:DEMO_NOW});
+  liveAlert(s,x,'rescheduled',{ar:'تغيير موعد حصة',en:'Class rescheduled'});return ok({sessionId:x.id});
+ },
+ 'live.cancel':(s,p,{actor})=>{
+  const g=sessionGuard(s,actor,p.sessionId);if(g.error)return fail(g.error);const x=g.session;
+  if(x.status==='cancelled')return ok({sessionId:x.id,existing:true});
+  if(!['scheduled','rescheduled'].includes(x.status))return fail('p6.invalidTransition');
+  Object.assign(x,{status:'cancelled',updated_at:DEMO_NOW});liveAlert(s,x,'cancelled',{ar:'أُلغيت حصة مباشرة',en:'Live class cancelled'});return ok({sessionId:x.id,existing:false});
+ },
+ 'recording.upload':(s,p,{actor})=>{
+  const g=sessionGuard(s,actor,p.sessionId);if(g.error)return fail(g.error);const x=g.session;
+  const existing=s.recordings.find(r=>r.live_session_id===x.id);if(existing)return ok({recordingId:existing.id,existing:true});
+  if(x.status!=='ended')return fail('p6.invalidTransition');
+  const filename=text(p.filename,80).split(/[\\/]/).pop();if(!RECORDING_FILE.test(filename))return failFields({filename:filename?'p6.recordingFileInvalid':'error.required'});
+  const r={id:nextId(s.recordings,'REC'),live_session_id:x.id,course_id:x.course_id,title:{ar:`تسجيل: ${x.title.ar}`,en:`Recording: ${x.title.en}`},state:'processing',duration_seconds:Math.round((Date.parse(x.ends_at)-Date.parse(x.starts_at))/1000),published_at:null,simulated_media_ref:'demo-recording-'+filename,created_at:DEMO_NOW,updated_at:DEMO_NOW};
+  s.recordings.push(r);Object.assign(x,{status:'recording_processing',updated_at:DEMO_NOW});return ok({recordingId:r.id,existing:false});
+ },
+ // Simulated processing completion: a ready recording stays private and alerts nobody.
+ 'recording.complete':(s,p,{actor})=>{
+  const r=s.recordings.find(x=>x.id===p.recordingId);if(!r)return fail('missing');const g=sessionGuard(s,actor,r.live_session_id);if(g.error)return fail(g.error);
+  if(r.state!=='processing')return ok({recordingId:r.id,existing:true});
+  Object.assign(r,{state:'ready',updated_at:DEMO_NOW});Object.assign(g.session,{status:'recording_ready',updated_at:DEMO_NOW});return ok({recordingId:r.id,existing:false});
+ },
+ 'recording.publish':(s,p,{actor})=>{
+  const r=s.recordings.find(x=>x.id===p.recordingId);if(!r)return fail('missing');const g=sessionGuard(s,actor,r.live_session_id);if(g.error)return fail(g.error);
+  if(r.state==='published')return ok({recordingId:r.id,existing:true});
+  if(r.state!=='ready')return fail('p6.recordingNotReady');
+  Object.assign(r,{state:'published',published_at:DEMO_NOW,updated_at:DEMO_NOW});Object.assign(g.session,{status:'recording_published',updated_at:DEMO_NOW});
+  notifyLearners(s,r.course_id,{event:'recording-published-'+r.id,type:'recording',title:{ar:'تسجيل جديد متاح',en:'New recording available'},body:structuredClone(r.title),href:`#/student/course/${r.course_id}?tab=live&recording=${r.id}`});
+  return ok({recordingId:r.id,existing:false});
+ },
+ 'announcement.post':(s,p,{actor})=>{
+  const g=ownedCourse(s,actor,p.courseId);if(g.error)return fail(g.error);if(g.course.status==='Archived')return fail('p6.lockedArchived');
+  const title=text(p.title,120),body=text(p.body,2000),errors=pick({title:lengthError(title,3),body:body&&body.length<10?'error.messageShort':lengthError(body,10)});if(Object.keys(errors).length)return failFields(errors);
+  const a={id:nextId(s.announcements,'ANN'),course_id:g.course.id,author_user_id:actor.user_id,title:typed(title),body:typed(body),published_at:DEMO_NOW,created_at:DEMO_NOW};
+  s.announcements.push(a);notifyLearners(s,g.course.id,{event:'announcement-'+a.id,type:'announcement',title:{ar:'إعلان جديد',en:'New announcement'},body:typed(title),href:`#/student/course/${g.course.id}?tab=announcements`});
+  return ok({announcementId:a.id});
+ },
+ // Inbox. Only the owner assigns; assignees must be active members holding reply_conversation on this course.
+ 'conversation.assign':(s,p,{actor})=>{
+  const q=s.conversations.find(x=>x.id===p.conversationId);if(!q)return fail('missing');
+  const g=ownedCourse(s,actor,q.course_id);if(g.error)return fail(g.error);
+  if(q.state==='resolved')return fail('p6.invalidTransition');
+  const self=p.assigneeUserId===actor.user_id,member=replyMembers(s,q.course_id).find(m=>m.user_id===p.assigneeUserId);
+  if(!self&&!member)return failFields({assigneeUserId:'p6.assigneeInvalid'});
+  if(q.assigned_user_id===p.assigneeUserId&&q.state==='assigned')return ok({conversationId:q.id,existing:true});
+  for(const a of s.conversation_assignments.filter(x=>x.conversation_id===q.id&&x.status==='active'))Object.assign(a,{status:'revoked',updated_at:DEMO_NOW});
+  const a={id:nextId(s.conversation_assignments,'QA'),conversation_id:q.id,assignee_user_id:p.assigneeUserId,assigned_by:actor.user_id,status:'active',created_at:DEMO_NOW,updated_at:DEMO_NOW};s.conversation_assignments.push(a);
+  const before=q.state;Object.assign(q,{assigned_user_id:p.assigneeUserId,state:'assigned',updated_at:DEMO_NOW});
+  audit(s,actor,'conversation.assign','conversation',q.id,before,'assigned');
+  if(!self)notifyUser(s,p.assigneeUserId,{event:'conversation-assigned-'+a.id,type:'assigned_conversation',title:{ar:'أُسند إليك سؤال',en:'Question assigned to you'},body:structuredClone(q.subject),href:'#/assistant/inbox/'+q.id,courseId:q.course_id});
+  return ok({conversationId:q.id,assignmentId:a.id,existing:false});
+ },
+ 'conversation.reply':(s,p,{actor,can})=>{
+  const g=conversationGuard(s,actor,p.conversationId,'reply_conversation',can);if(g.error)return fail(g.error);const q=g.conversation;
+  const body=text(p.text,2000),error=lengthError(body,2);if(error)return failFields({text:error});
+  const m=postMessage(s,q,actor,body,false);
+  if(q.state==='open')Object.assign(q,{assigned_user_id:q.assigned_user_id??actor.user_id,state:'assigned'});
+  const st=s.students.find(x=>x.id===q.student_id);
+  notifyUser(s,st?.user_id,{event:'reply-'+m.id,type:'qa_reply',title:{ar:'رد جديد على سؤالك',en:'New reply to your question'},body:structuredClone(q.subject),href:'#/student/messages/'+q.id,courseId:q.course_id});
+  return ok({conversationId:q.id,messageId:m.id});
+ },
+ // Internal notes are staff-only: never notified, never returned by learner or guardian selectors.
+ 'conversation.note':(s,p,{actor,can})=>{
+  const g=conversationGuard(s,actor,p.conversationId,'reply_conversation',can);if(g.error)return fail(g.error);
+  const body=text(p.text,2000),error=lengthError(body,2);if(error)return failFields({text:error});
+  const m=postMessage(s,g.conversation,actor,body,true);audit(s,actor,'conversation.note','conversation',g.conversation.id,'','internal_note');return ok({conversationId:g.conversation.id,messageId:m.id});
+ },
+ 'conversation.setStatus':(s,p,{actor,can})=>{
+  const g=conversationGuard(s,actor,p.conversationId,'reply_conversation',can);if(g.error)return fail(g.error);const q=g.conversation;
+  if(q.state===p.status)return ok({conversationId:q.id,existing:true});
+  if(!(CONVERSATION_NEXT[q.state]??[]).includes(p.status)||(p.status==='assigned'&&!q.assigned_user_id))return fail('p6.invalidTransition');
+  if(q.state==='escalated'&&g.course.owner_teacher_id!==teacherOf(s,actor)?.id)return fail('p6.ownerOnly');
+  const before=q.state;Object.assign(q,{state:p.status,updated_at:DEMO_NOW});audit(s,actor,'conversation.status','conversation',q.id,before,p.status);
+  const owner=s.teachers.find(x=>x.id===g.course.owner_teacher_id);
+  if(p.status==='escalated'&&owner?.user_id!==actor.user_id)notifyUser(s,owner?.user_id,{event:`conversation-escalated-${q.id}-${s.audit_events.length}`,type:'escalation',title:{ar:'سؤال مصعّد إليك',en:'Question escalated to you'},body:structuredClone(q.subject),href:'#/teacher/inbox/'+q.id,courseId:q.course_id});
+  return ok({conversationId:q.id,state:q.state});
+ },
+ 'conversation.report':(s,p,{actor,can})=>{
+  const g=conversationGuard(s,actor,p.conversationId,'reply_conversation',can);if(g.error)return fail(g.error);const q=g.conversation;
+  const m=p.messageId?s.messages.find(x=>x.id===p.messageId&&x.conversation_id===q.id&&x.moderation_state!=='removed'):null;if(p.messageId&&!m)return fail('missing');
+  if(!Object.hasOwn(REPORT_REASONS,p.reason))return failFields({reason:'p4.reasonRequired'});
+  const existing=s.safety_reports.find(r=>r.reporter_user_id===actor.user_id&&(m?r.message_id===m.id:!r.message_id&&r.conversation_id===q.id));
+  if(existing)return ok({reportId:existing.id,existing:true});
+  const r={id:nextId(s.safety_reports,'SR'),reporter_user_id:actor.user_id,message_id:m?.id??null,conversation_id:q.id,course_id:q.course_id,reason:structuredClone(REPORT_REASONS[p.reason]),state:'open',restricted_note:'',assigned_staff_id:null,created_at:DEMO_NOW,updated_at:DEMO_NOW};
+  s.safety_reports.push(r);if(m?.moderation_state==='visible')Object.assign(m,{moderation_state:'flagged',updated_at:DEMO_NOW});
+  audit(s,actor,'conversation.report','conversation',q.id,'',r.id,p.reason);return ok({reportId:r.id,existing:false});
+ },
+ // Teaching team: synthetic invitations, per-course capability matrix and immediate revocation.
+ 'team.invite':(s,p,{actor})=>{
+  const teacher=teacherOf(s,actor);if(!teacher)return fail('p6.teacherOnly');
+  const email=text(p.email,120).toLowerCase(),days=INVITE_DAYS.includes(String(p.days))?Number(p.days):null;
+  const errors=pick({email:!email?'error.required':!EMAIL.test(email)?'error.email':!email.endsWith('@example.test')?'p6.syntheticEmail':null,team_role:TEAM_ROLES.includes(p.team_role)?null:'error.required',days:days?null:'error.required'});
+  const existingUser=errors.email?null:s.users.find(u=>u.email===email);
+  if(existingUser&&(existingUser.id===actor.user_id||s.teacher_team_members.some(m=>m.teacher_id===teacher.id&&m.user_id===existingUser.id&&['active','invited'].includes(m.status))))errors.email='p6.alreadyMember';
+  else if(existingUser&&s.role_assignments.some(r=>r.user_id===existingUser.id&&r.role!=='assistant'))errors.email='p6.notInvitable';
+  if(Object.keys(errors).length)return failFields(errors);
+  let user=existingUser;
+  if(!user){user={id:nextId(s.users.filter(u=>u.id.startsWith('U-INV-')),'U-INV'),name:typed(email.split('@')[0]),email,status:'invited',locale:'ar',created_at:DEMO_NOW,updated_at:DEMO_NOW};s.users.push(user);}
+  const m={id:nextId(s.teacher_team_members,'TM'),teacher_id:teacher.id,user_id:user.id,status:'invited',team_role:p.team_role,invited_at:DEMO_NOW,expires_at:new Date(Date.parse(DEMO_NOW)+days*DAY).toISOString().replace('.000Z','Z'),created_at:DEMO_NOW,updated_at:DEMO_NOW};
+  s.teacher_team_members.push(m);audit(s,actor,'team.invite','teacher_team_member',m.id,'','invited',p.team_role);return ok({memberId:m.id});
+ },
+ 'team.assign':(s,p,{actor})=>{
+  const g=teamMember(s,actor,p.memberId);if(g.error)return fail(g.error);if(g.member.status!=='active')return fail('p6.memberNotActive');
+  const matrix=p.assignments&&typeof p.assignments==='object'?p.assignments:{};
+  for(const [courseId,caps] of Object.entries(matrix)){const c=s.courses.find(x=>x.id===courseId);if(!c)return fail('missing');if(c.owner_teacher_id!==g.teacher.id)return fail('resourceDenied');if(c.status==='Archived')return fail('p6.lockedArchived');if(!Array.isArray(caps)||caps.some(x=>!TEAM_CAPABILITIES.includes(x)))return fail('invalidAction');}
+  const summary=[];
+  for(const [courseId,caps] of Object.entries(matrix)) {
+   const list=TEAM_CAPABILITIES.filter(x=>caps.includes(x)),row=s.course_team_assignments.find(a=>a.team_member_id===g.member.id&&a.course_id===courseId);
+   if(row)Object.assign(row,{capabilities:list,status:list.length?'active':'revoked',updated_at:DEMO_NOW});
+   else if(list.length)s.course_team_assignments.push({id:nextId(s.course_team_assignments,'CTA'),team_member_id:g.member.id,course_id:courseId,capabilities:list,status:'active',created_at:DEMO_NOW,updated_at:DEMO_NOW});
+   summary.push(`${courseId}:${list.join('+')||'none'}`);
+  }
+  audit(s,actor,'team.assign','teacher_team_member',g.member.id,'',summary.join(' '));return ok({memberId:g.member.id});
+ },
+ 'team.revoke':(s,p,{actor})=>{
+  const g=teamMember(s,actor,p.memberId);if(g.error)return fail(g.error);const m=g.member;
+  if(!['active','invited'].includes(m.status))return ok({memberId:m.id,existing:true});
+  const before=m.status,ids=ownedIds(s,g.teacher);Object.assign(m,{status:'deactivated',updated_at:DEMO_NOW});
+  for(const a of s.course_team_assignments.filter(x=>x.team_member_id===m.id&&x.status==='active'))Object.assign(a,{status:'revoked',updated_at:DEMO_NOW});
+  for(const a of s.conversation_assignments.filter(x=>x.assignee_user_id===m.user_id&&x.status==='active'&&ids.has(s.conversations.find(q=>q.id===x.conversation_id)?.course_id)))Object.assign(a,{status:'revoked',updated_at:DEMO_NOW});
+  for(const q of s.conversations.filter(x=>ids.has(x.course_id)&&x.assigned_user_id===m.user_id))Object.assign(q,{assigned_user_id:null,state:q.state==='resolved'?'resolved':'open',updated_at:DEMO_NOW});
+  audit(s,actor,'team.revoke','teacher_team_member',m.id,before,'deactivated');return ok({memberId:m.id,existing:false});
+ },
+ // Destination changes are requests only: finance verifies before anything changes; only a masked tail is kept.
+ 'payoutAccount.requestChange':(s,p,{actor})=>{
+  const teacher=teacherOf(s,actor);if(!teacher)return fail('p6.teacherOnly');
+  const account=s.teacher_payout_accounts.find(a=>a.teacher_id===teacher.id);if(!account)return fail('missing');
+  if(account.change_request?.state==='pending_verification')return ok({accountId:account.id,existing:true});
+  const name=text(p.beneficiaryName,120),tail=text(p.accountRef,8);
+  const errors=pick({beneficiaryName:lengthError(name,3),accountRef:/^\d{4}$/.test(tail)?null:'p6.accountRefInvalid',consent:p.consent===true||p.consent==='on'?null:'error.consent'});if(Object.keys(errors).length)return failFields(errors);
+  account.change_request={state:'pending_verification',beneficiary_name:typed(name),masked_iban:`OM•• •••• •••• DEMO ${tail}`,requested_at:DEMO_NOW};account.updated_at=DEMO_NOW;
+  audit(s,actor,'payout_account.request_change','teacher_payout_account',account.id,account.masked_iban,'change_requested');
+  for(const u of userRoleIds(s,'admin_finance'))notifyUser(s,u,{event:'payout-account-change-'+account.id,type:'payout_account',title:{ar:'طلب تغيير حساب صرف',en:'Payout destination change request'},body:structuredClone(teacher.name),href:'#/admin/finance/payouts?tab=accounts',courseId:null});
+  return ok({accountId:account.id,existing:false});
+ },
+ 'teacher.updateProfile':(s,p,{actor})=>{
+  const teacher=teacherOf(s,actor);if(!teacher)return fail('p6.teacherOnly');
+  const r=pairText({ar:p.bio_ar,en:p.bio_en},20,600),errors=pick({bio_ar:r.errors.ar&&(r.value.ar?'error.bioShort':'error.required'),bio_en:r.errors.en&&(r.value.en?'error.bioShort':'error.required')});
+  if(Object.keys(errors).length)return failFields(errors);
+  Object.assign(teacher,{bio:r.value,updated_at:DEMO_NOW});return ok({teacherId:teacher.id});
+ },
+ 'qualification.request':(s,p,{actor})=>{
+  const teacher=teacherOf(s,actor);if(!teacher)return fail('p6.teacherOnly');
+  const gs=s.grade_subjects.find(g=>g.id===p.gradeSubjectId&&g.active);if(!gs)return failFields({gradeSubjectId:'error.required'});
+  const held=s.teacher_grade_subjects.find(q=>q.teacher_id===teacher.id&&q.grade_subject_id===gs.id);if(held)return held.verification_state==='verified'?failFields({gradeSubjectId:'p6.alreadyQualified'}):ok({id:held.id,existing:true});
+  const row={id:nextId(s.teacher_grade_subjects,'TGS'),teacher_id:teacher.id,grade_subject_id:gs.id,verification_state:'pending',note:text(p.note,300),created_at:DEMO_NOW,updated_at:DEMO_NOW};
+  s.teacher_grade_subjects.push(row);audit(s,actor,'qualification.request','teacher_grade_subject',row.id,'','pending',row.note);
+  for(const m of moderators(s))notifyUser(s,m,{event:'qualification-'+row.id,type:'qualification',title:{ar:'طلب مؤهل تدريس جديد',en:'Teaching qualification request'},body:structuredClone(teacher.name),href:'#/admin/people/teachers',courseId:null});
+  return ok({id:row.id,existing:false});
+ },
+ 'teacher.updateSettings':(s,p,{actor})=>{
+  const teacher=teacherOf(s,actor);if(!teacher)return fail('p6.teacherOnly');
+  teacher.notification_prefs=Object.fromEntries(TEACHER_PREFS.map(k=>[k,p.prefs?.[k]===true||p.prefs?.[k]==='on']));teacher.updated_at=DEMO_NOW;return ok({...teacher.notification_prefs});
+ },
+});

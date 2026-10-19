@@ -938,4 +938,259 @@ dictionary.unknown=unknownEntry;
 resetDemoData();dispatch('preferences.set',{role:'visitor',lang:'ar'});
 console.log(`P5 render smoke: ${p5Renders} renders`);
 
+// ---------------------------------------------------------------- P6 teacher portal
+const p6Reset=(role='teacher')=>{resetDemoData();dispatch('preferences.set',{role,lang:'ar'});};
+const teacherRoute=path=>routes.find(r=>r.path===path);
+const p6Render=(path,params={},query='')=>{const route=teacherRoute(path),ctx={params,query:new URLSearchParams(query),role:getState().preferences.role,actor:select('actor'),route,path:path.replace(':id',params.id??''),dispatch,navigate:()=>{}};for(const [key,values] of Object.entries(route.queryValues))if(ctx.query.has(key)&&!values.includes(ctx.query.get(key)))ctx.query.set(key,values[0]);return {html:route.view.render(ctx),ctx};};
+const IDENTITY={title_ar:'الكسور للصف الرابع',title_en:'Fractions for Grade 4',summary_ar:'ملخص قصير للدورة الجديدة',summary_en:'A short summary of the new course',description_ar:'وصف تفصيلي للدورة الجديدة يشرح المحتوى',description_en:'A detailed description of the new course content'};
+const ACADEMICS={curriculum_version_id:'CV-001',grade_subject_id:'GS-4-math',academic_year_id:'AY-002',semester_id:'SEM-003',language:'ar',mode:'recorded'};
+const p6Create=()=>{const a=dispatch('course.saveDraft',{step:'identity',values:IDENTITY});assert.ok(a.ok&&!a.data.created&&a.data.next==='academics',JSON.stringify(a));const b=dispatch('course.saveDraft',{step:'academics',values:ACADEMICS});assert.ok(b.ok&&b.data.created,JSON.stringify(b));return b.data.id;};
+const p6Prepare=id=>{const mod=getState().modules.find(m=>m.course_id===id);assert.ok(dispatch('lesson.add',{courseId:id,moduleId:mod.id,title_ar:'درس المعاينة',title_en:'Preview lesson',type:'video',duration:'6',state:'ready',preview:true,body:'Watch the worked example first.'}).ok);assert.ok(dispatch('course.saveDraft',{courseId:id,step:'access',values:{price_type:'paid',price:'25.500',access_kind:'academic_year'}}).ok);};
+const notesFor=event=>getState().notifications.filter(n=>n.event_id===event);
+const asPersona=(role,patch,fn)=>{const saved={...PERSONAS[role]};Object.assign(PERSONAS[role],patch);try{fn();}finally{Object.assign(PERSONAS[role],saved);}};
+check('P6 wizard: identity + academics create a Draft with generated ID; submit moves Draft → Submitted',()=>{
+ p6Reset();const before=getState().courses.length,id=p6Create(),c=course(id);
+ assert.equal(id,'C-025');assert.equal(getState().courses.length,before+1);assert.deepEqual([c.status,c.owner_teacher_id,c.grade_subject_id,c.price_type],['Draft','T-001','GS-4-math','free']);
+ assert.equal(c.title.en,'Fractions for Grade 4');assert.equal(getState().transient.courseDraft,undefined);assert.equal(getState().modules.filter(m=>m.course_id===id).length,1);
+ const pre=getState();assert.equal(dispatch('course.submit',{courseId:id}).errorKey,'p6.checklistIncomplete');assert.equal(getState(),pre);
+ assert.equal(dispatch('course.saveDraft',{courseId:id,step:'access',values:{price_type:'paid',price:'0',access_kind:'academic_year'}}).fieldErrors.price,'p6.pricePositive');
+ p6Prepare(id);assert.equal(course(id).price_baisa,25500);assert.ok(select('teacher.editor',{id}).checklist.filter(x=>x.blocking).every(x=>x.ok));
+ const notes=getState().notifications.length,r=dispatch('course.submit',{courseId:id});assert.ok(r.ok&&!r.data.existing);assert.equal(course(id).status,'Submitted');
+ assert.ok(dispatch('course.submit',{courseId:id}).data.existing,'idempotent submit');assert.equal(getState().audit_events.filter(e=>e.resource_id===id&&e.action==='course.submit').length,1);
+ assert.ok(getState().notifications.slice(notes).some(n=>n.recipient_user_id==='U-M001'&&n.href==='#/admin/courses/review'));
+ assert.equal(dispatch('course.saveDraft',{courseId:id,step:'identity',values:IDENTITY}).errorKey,'p6.lockedInReview');assert.equal(dispatch('lesson.add',{courseId:id,moduleId:getState().modules.find(m=>m.course_id===id).id,title_ar:'درس',title_en:'Lesson',type:'reading',duration:'5',state:'ready',body:'Body of the lesson here.'}).errorKey,'p6.lockedInReview');
+ dispatch('preferences.set',{role:'visitor'});assert.equal(select('course.public',{id}),null);assert.ok(!select('catalog.search',{grade:'4',subject:'math'}).some(x=>x.id===id),'Submitted never listed');
+});
+check('P6 grade-subject outside verified qualifications is rejected in wizard, forged dispatch and moderation',()=>{
+ p6Reset();const pre=getState();
+ const forged={...ACADEMICS,grade_subject_id:'GS-12-english'};
+ assert.equal(dispatch('course.saveDraft',{courseId:'C-003',step:'academics',values:forged}).fieldErrors.grade_subject_id,'p6.notQualified');
+ assert.equal(dispatch('course.saveDraft',{step:'academics',values:forged}).fieldErrors.grade_subject_id,'p6.notQualified');assert.equal(getState(),pre);
+ assert.equal(dispatch('course.saveDraft',{step:'academics',values:{...ACADEMICS,grade_subject_id:'GS-4-arabic'}}).fieldErrors.grade_subject_id,'p6.notQualified');
+ const pairs=select('teacher.editor',{}).pairs.map(p=>p.id);assert.equal(pairs.length,12);assert.ok(pairs.every(p=>/^GS-[1-6]-(math|science)$/.test(p)));
+ assert.equal(dispatch('course.saveDraft',{step:'academics',values:{...ACADEMICS,semester_id:'SEM-001'}}).fieldErrors.semester_id,'p6.semesterMismatch');
+ asPersona('teacher',{user_id:'U-T002',record_id:'T-002'},()=>{
+  assert.equal(dispatch('course.saveDraft',{step:'academics',values:{...ACADEMICS,grade_subject_id:'GS-6-math'}}).fieldErrors.grade_subject_id,'p6.notQualified','T-002 grade 6');
+  assert.ok(dispatch('course.saveDraft',{step:'academics',values:{...ACADEMICS,grade_subject_id:'GS-12-english',language:'en'}}).ok,'T-002 own pair');
+  assert.deepEqual(select('teacher.editor',{}).pairs.map(p=>p.id),['GS-12-english']);
+ });
+ for(const role of ['teacher','admin_finance','student']){dispatch('preferences.set',{role});assert.equal(dispatch('course.review',{courseId:'C-012',decision:'approve'}).errorKey,'resourceDenied',role);}
+});
+{
+ const fixtureSource=storeSource.replace("'./data.js'",JSON.stringify(new URL('../prototype/core/data.js',import.meta.url).href)).replaceAll('...createSeed()','...fixtureSeed()')+`\nfunction fixtureSeed(){const s=createSeed();s.courses.find(c=>c.id==='C-012').grade_subject_id='GS-12-english';return s;}`;
+ const iso=await import('data:text/javascript;base64,'+Buffer.from(fixtureSource).toString('base64'));
+ check('P6 moderation re-validates qualifications: forged T-001 grade12 English cannot be approved',()=>{
+  iso.dispatch('preferences.set',{role:'admin_moderation'});const r=iso.dispatch('course.review',{courseId:'C-012',decision:'approve'});
+  assert.equal(r.errorKey,'p6.notQualified');assert.equal(iso.getState().courses.find(c=>c.id==='C-012').status,'Submitted');
+ });
+}
+check('P6 scenario 5: request changes → edit/resubmit → approve → visitor grade 4 Math results include the course',()=>{
+ p6Reset();const id=p6Create();p6Prepare(id);assert.ok(dispatch('course.submit',{courseId:id}).ok);
+ dispatch('preferences.set',{role:'admin_moderation'});
+ assert.equal(dispatch('course.review',{courseId:id,decision:'requestChanges',feedback:'short'}).fieldErrors.feedback,'error.messageShort');
+ assert.ok(dispatch('course.review',{courseId:id,decision:'requestChanges',feedback:'Please add a worked example to the preview lesson.'}).ok);
+ assert.equal(course(id).status,'ChangesRequested');assert.equal(course(id).review_feedback.en,'Please add a worked example to the preview lesson.');
+ assert.equal(dispatch('course.review',{courseId:id,decision:'approve'}).errorKey,'p6.invalidTransition','no approval while changes requested');
+ dispatch('preferences.set',{role:'teacher'});
+ assert.ok(getState().notifications.some(n=>n.recipient_user_id==='U-T001'&&n.type==='review_feedback'&&n.related_course_id===id));
+ assert.ok(select('teacher.dashboard').feedback.some(c=>c.id===id));assert.ok(select('teacher.courses').find(c=>c.id===id).feedback);
+ assert.ok(dispatch('course.saveDraft',{courseId:id,step:'identity',values:{...IDENTITY,summary_en:'A revised summary with a worked example'}}).ok);
+ assert.ok(dispatch('course.submit',{courseId:id}).ok);assert.equal(course(id).status,'Submitted');
+ dispatch('preferences.set',{role:'admin_moderation'});const r=dispatch('course.review',{courseId:id,decision:'approve'});assert.ok(r.ok,JSON.stringify(r));
+ const c=course(id);assert.equal(c.status,'Published');assert.equal(c.published_snapshot.summary.en,'A revised summary with a worked example');assert.deepEqual(c.review_feedback,{ar:'',en:''});
+ assert.ok(getState().lessons.filter(l=>getState().modules.some(m=>m.id===l.module_id&&m.course_id===id)).every(l=>l.state==='published'));
+ assert.deepEqual(getState().audit_events.filter(e=>e.resource_id===id).map(e=>e.action),['course.create','course.submit','course.request_changes','course.submit','course.approve']);
+ dispatch('preferences.set',{role:'visitor'});assert.ok(select('catalog.search',{grade:'4',subject:'math'}).some(x=>x.id===id));assert.equal(select('course.public',{id}).title.en,'Fractions for Grade 4');
+ assert.ok(select('course.public',{id}).modules[0].lessons.some(l=>l.preview));
+});
+check('P6 published edit → pending_revision; public keeps the approved snapshot until approval',()=>{
+ p6Reset();const old=course('C-001').description.en,edited={...IDENTITY,...Object.fromEntries(['title','summary','description'].flatMap(k=>[[k+'_ar',course('C-001')[k].ar],[k+'_en',course('C-001')[k].en]])),description_en:'An updated description with new souq examples for fractions.'};
+ assert.ok(dispatch('course.saveDraft',{courseId:'C-001',step:'identity',values:edited}).data.revision);
+ const c=course('C-001');assert.equal(c.status,'Published');assert.equal(c.description.en,old,'live field untouched');assert.equal(c.pending_revision.fields.description.en,edited.description_en);assert.equal(c.pending_revision.status,'Draft');
+ assert.equal(select('teacher.editor',{id:'C-001'}).course.description.en,edited.description_en);
+ for(const role of ['visitor','student']){dispatch('preferences.set',{role});assert.equal(select('course.public',{id:'C-001'}).description.en,old,role);}
+ dispatch('preferences.set',{role:'teacher'});assert.ok(dispatch('course.submit',{courseId:'C-001'}).data.revision);assert.equal(course('C-001').pending_revision.status,'Submitted');assert.equal(course('C-001').status,'Published');
+ assert.equal(dispatch('course.saveDraft',{courseId:'C-001',step:'identity',values:edited}).errorKey,'p6.lockedInReview');
+ dispatch('preferences.set',{role:'visitor'});assert.equal(select('course.public',{id:'C-001'}).description.en,old,'still old while in review');
+ dispatch('preferences.set',{role:'admin_moderation'});assert.ok(dispatch('course.review',{courseId:'C-001',decision:'approve'}).ok);
+ dispatch('preferences.set',{role:'visitor'});assert.equal(select('course.public',{id:'C-001'}).description.en,edited.description_en);assert.equal(course('C-001').pending_revision,null);
+ dispatch('preferences.set',{role:'teacher'});assert.equal(dispatch('course.requestRevision',{courseId:'C-003'}).errorKey,'p6.invalidTransition');assert.ok(dispatch('course.requestRevision',{courseId:'C-002'}).ok);assert.ok(dispatch('course.requestRevision',{courseId:'C-002'}).data.existing);
+});
+check('P6 live: schedule notifies each eligible learner once; reschedule and cancel send corrected notices',()=>{
+ p6Reset();const eligible=['U-S001','U-S003','U-S004'];
+ assert.equal(dispatch('live.schedule',{courseId:'C-002',title:'Plant lab',starts_at:'2026-10-18T17:00',duration:'60'}).fieldErrors.starts_at,'p6.startFuture');
+ assert.equal(dispatch('live.schedule',{courseId:'C-004',title:'Plant lab',starts_at:'2026-10-26T17:00',duration:'60'}).errorKey,'resourceDenied');
+ const r=dispatch('live.schedule',{courseId:'C-002',title:'Plant lab',starts_at:'2026-10-26T17:00',duration:'60'});assert.ok(r.ok);const id=r.data.sessionId,x=()=>getState().live_sessions.find(s=>s.id===id);
+ assert.deepEqual([x().starts_at,x().ends_at,x().status],['2026-10-26T13:00:00Z','2026-10-26T14:00:00Z','scheduled']);
+ const recipients=event=>notesFor(event).map(n=>n.recipient_user_id).sort();
+ assert.deepEqual(recipients(`live-scheduled-${id}-1`),eligible);assert.ok(!getState().notifications.some(n=>n.recipient_user_id==='U-S002'&&n.event_id.includes(id)));
+ assert.ok(dispatch('live.reschedule',{sessionId:id,starts_at:'2026-10-27T18:30'}).ok);assert.deepEqual([x().status,x().join_generation,x().starts_at],['rescheduled',2,'2026-10-27T14:30:00Z']);
+ assert.deepEqual(recipients(`live-rescheduled-${id}-2`),eligible);
+ assert.ok(dispatch('live.cancel',{sessionId:id}).ok);const count=getState().notifications.length;assert.deepEqual(recipients(`live-cancelled-${id}-2`),eligible);
+ assert.ok(dispatch('live.cancel',{sessionId:id}).data.existing);assert.equal(getState().notifications.length,count,'repeat cancel sends nothing');
+ assert.equal(dispatch('live.reschedule',{sessionId:id,starts_at:'2026-10-28T18:30'}).errorKey,'p6.invalidTransition');
+ assert.equal(dispatch('live.cancel',{sessionId:'LS-004'}).errorKey,'p6.invalidTransition','ended session');
+ for(const e of eligible)assert.equal(getState().notifications.filter(n=>n.recipient_user_id===e&&n.event_id.includes(id)).length,3,e);
+ dispatch('preferences.set',{role:'student'});const s=select('student.room',{courseId:'C-002'}).sessions.find(v=>v.id===id);assert.equal(s.joinable,false);assert.equal(dispatch('live.join',{sessionId:id}).errorKey,'p4.joinCancelled');
+});
+check('P6 recordings: upload → processing → ready (no alert) → publish alerts once, repeat publish adds nothing',()=>{
+ p6Reset();const n0=getState().notifications.length;
+ assert.equal(dispatch('recording.upload',{sessionId:'LS-004',filename:'notes.exe'}).fieldErrors.filename,'p6.recordingFileInvalid');
+ assert.equal(dispatch('recording.upload',{sessionId:'LS-001',filename:'class.mp4'}).errorKey,'p6.invalidTransition','scheduled session');
+ assert.equal(dispatch('recording.upload',{sessionId:'LS-012',filename:'class.mp4'}).errorKey,'resourceDenied','T-002 session');
+ const r=dispatch('recording.upload',{sessionId:'LS-004',filename:'plants.mp4'});assert.ok(r.ok);const id=r.data.recordingId,rec=()=>getState().recordings.find(x=>x.id===id),ls=()=>getState().live_sessions.find(x=>x.id==='LS-004');
+ assert.deepEqual([rec().state,ls().status],['processing','recording_processing']);assert.equal(dispatch('recording.publish',{recordingId:id}).errorKey,'p6.recordingNotReady');
+ assert.ok(dispatch('recording.complete',{recordingId:id}).ok);assert.deepEqual([rec().state,ls().status],['ready','recording_ready']);assert.equal(getState().notifications.length,n0,'no alert before publish');
+ dispatch('preferences.set',{role:'student'});assert.ok(!select('student.room',{courseId:'C-002'}).recordings.some(x=>x.id===id));dispatch('preferences.set',{role:'teacher'});
+ assert.ok(dispatch('recording.publish',{recordingId:id}).ok);assert.deepEqual(notesFor('recording-published-'+id).map(n=>n.recipient_user_id).sort(),['U-S001','U-S003','U-S004']);
+ const n1=getState().notifications.length;assert.ok(dispatch('recording.publish',{recordingId:id}).data.existing);assert.ok(dispatch('recording.upload',{sessionId:'LS-004',filename:'again.mp4'}).data.existing);assert.equal(getState().notifications.length,n1);
+ dispatch('preferences.set',{role:'student'});assert.ok(select('student.room',{courseId:'C-002'}).recordings.some(x=>x.id===id));
+});
+check('P6 grading: grade stays private until release; release notifies the learner once',()=>{
+ p6Reset('student');assert.ok(dispatch('enrollment.enrollFree',{courseId:'C-005'}).ok);assert.ok(dispatch('assignment.submit',{assignmentId:'ASG-004',text:'I separated salt from water by evaporation.'}).ok);
+ const sub=getState().submissions.at(-1);dispatch('preferences.set',{role:'teacher'});
+ assert.ok(select('teacher.workspace',{id:'C-005'}).submissions.some(x=>x.id===sub.id));
+ assert.equal(dispatch('submission.grade',{submissionId:sub.id,score:'101',feedback:'Great'}).fieldErrors.score,'p6.scoreRange');
+ assert.equal(dispatch('submission.release',{submissionId:sub.id}).errorKey,'p6.gradeFirst');
+ assert.ok(dispatch('submission.grade',{submissionId:sub.id,score:'90',feedback:'Clear method, well explained.'}).ok);
+ const asStudent=()=>{dispatch('preferences.set',{role:'student'});const a=select('student.room',{courseId:'C-005'}).assignments.find(x=>x.id==='ASG-004');dispatch('preferences.set',{role:'teacher'});return a;};
+ assert.deepEqual([asStudent().state,asStudent().grade],['submitted',null]);
+ assert.ok(dispatch('submission.release',{submissionId:sub.id}).ok);const a=asStudent();assert.deepEqual([a.state,a.grade.score,a.grade.feedback],['released',90,'Clear method, well explained.']);
+ const grade=getState().assessment_grades.find(g=>g.submission_id===sub.id);assert.equal(notesFor('grade-released-'+grade.id).length,1);assert.equal(notesFor('grade-released-'+grade.id)[0].recipient_user_id,'U-S001');
+ assert.ok(dispatch('submission.release',{submissionId:sub.id}).data.existing);assert.equal(notesFor('grade-released-'+grade.id).length,1);
+ assert.equal(dispatch('submission.grade',{submissionId:sub.id,score:'50',feedback:'Changed'}).errorKey,'p6.alreadyReleased');
+ assert.ok(dispatch('submission.release',{submissionId:'SUB-002'}).ok,'assistant-graded C-001 submission');
+ assert.equal(dispatch('submission.grade',{submissionId:'SUB-005',score:'80',feedback:'Nice'}).errorKey,'resourceDenied','C-004 owned by T-002');
+});
+check('P6 team: capability matrix, invitation and revoke remove assistant access to C-001/C-002 immediately',()=>{
+ p6Reset('assistant');assert.ok(can('read_content',course('C-001'))&&can('read_content',course('C-002')));assert.equal(can('grade_assignment',course('C-005')),false);
+ const conv=id=>getState().conversations.find(q=>q.id===id);assert.ok(can('conversation.read',conv('Q-001')));
+ dispatch('preferences.set',{role:'teacher'});
+ assert.equal(dispatch('team.assign',{memberId:'TM-001',assignments:{'C-004':['read_content']}}).errorKey,'resourceDenied');
+ assert.equal(dispatch('team.assign',{memberId:'TM-001',assignments:{'C-005':['root']}}).errorKey,'invalidAction');
+ assert.equal(dispatch('team.assign',{memberId:'TM-002',assignments:{'C-005':['read_content']}}).errorKey,'p6.memberNotActive');
+ assert.ok(dispatch('team.assign',{memberId:'TM-001',assignments:{'C-005':['grade_assignment','read_content']}}).ok);
+ dispatch('preferences.set',{role:'assistant'});assert.ok(can('grade_assignment',course('C-005')));dispatch('preferences.set',{role:'teacher'});
+ assert.equal(dispatch('team.invite',{email:'helper@gmail.com',team_role:'assistant',days:'14'}).fieldErrors.email,'p6.syntheticEmail');
+ assert.equal(dispatch('team.invite',{email:'noora.hinai@example.test',team_role:'assistant',days:'14'}).fieldErrors.email,'p6.alreadyMember');
+ assert.equal(dispatch('team.invite',{email:'maryam.balushi@example.test',team_role:'assistant',days:'14'}).fieldErrors.email,'p6.notInvitable');
+ const inv=dispatch('team.invite',{email:'helper@example.test',team_role:'grader',days:'7'});assert.ok(inv.ok);
+ const m=getState().teacher_team_members.find(x=>x.id===inv.data.memberId);assert.deepEqual([m.status,m.team_role,m.expires_at],['invited','grader','2026-10-26T08:00:00Z']);
+ assert.equal(select('teacher.team').invitations.length,2);
+ const audits=getState().audit_events.length;assert.ok(dispatch('team.revoke',{memberId:'TM-001'}).ok);assert.equal(getState().audit_events.at(-1).action,'team.revoke');assert.equal(getState().audit_events.length,audits+1);
+ assert.ok(getState().course_team_assignments.filter(a=>a.team_member_id==='TM-001').every(a=>a.status==='revoked'));
+ for(const id of ['Q-001','Q-002','Q-003'])assert.deepEqual([conv(id).assigned_user_id,conv(id).state],[null,'open'],id);
+ assert.ok(dispatch('team.revoke',{memberId:'TM-001'}).data.existing);assert.equal(dispatch('team.revoke',{memberId:'TM-999'}).errorKey,'missing');
+ dispatch('preferences.set',{role:'assistant'});
+ for(const id of ['C-001','C-002','C-005'])for(const action of ['read_content','reply_conversation','grade_assignment','edit_content'])assert.equal(can(action,course(id)),false,id+action);
+ assert.equal(can('conversation.read',conv('Q-001')),false);assert.equal(dispatch('conversation.reply',{conversationId:'Q-001',text:'Still here?'}).errorKey,'resourceDenied');
+});
+check('P6 teacher scope: C-004 (T-002) learners, conversations and content stay hidden and immutable',()=>{
+ p6Reset();
+ assert.equal(select('teacher.workspace',{id:'C-004'}).status,'denied');assert.equal(select('teacher.editor',{id:'C-004'}).status,'denied');assert.equal(select('teacher.workspace',{id:'C-999'}).status,'missing');
+ const owned=new Set(getState().courses.filter(c=>c.owner_teacher_id==='T-001').map(c=>c.id));
+ assert.ok(select('teacher.students',{}).rows.every(r=>owned.has(r.course_id)));assert.ok(!select('teacher.students',{courseId:'C-004'}).rows.some(r=>r.course_id==='C-004'));
+ assert.equal(select('teacher.student',{id:'S-006'}).status,'denied');assert.equal(select('teacher.student',{id:'S-999'}).status,'missing');assert.equal(select('teacher.student',{id:'S-003'}).status,'ok');
+ assert.ok(!select('teacher.inbox',{}).all.some(q=>q.id==='Q-007'));assert.equal(select('teacher.thread',{id:'Q-007'}).status,'denied');assert.equal(select('teacher.thread',{id:'Q-999'}).status,'missing');
+ assert.ok(!select('teacher.calendar').sessions.some(x=>x.course_id==='C-004'));
+ const pre=getState(),c004Lesson=getState().lessons.find(l=>getState().modules.find(m=>m.id===l.module_id).course_id==='C-004');
+ for(const [type,payload] of [['conversation.reply',{conversationId:'Q-007',text:'Hello there'}],['conversation.note',{conversationId:'Q-007',text:'Note'}],['conversation.assign',{conversationId:'Q-007',assigneeUserId:'U-T001'}],['lesson.update',{lessonId:c004Lesson.id,preview:true}],['announcement.post',{courseId:'C-004',title:'Hello all',body:'An announcement body.'}],['course.submit',{courseId:'C-004'}],['course.saveDraft',{courseId:'C-004',step:'identity',values:IDENTITY}],['submission.grade',{submissionId:'SUB-005',score:'1',feedback:'ok'}]])assert.equal(dispatch(type,payload).errorKey,'resourceDenied',type);
+ assert.equal(getState(),pre,'no mutation');
+ const name=esc(L(course('C-004').title));for(const [path,params] of [['/teacher/course/:id',{id:'C-004'}],['/teacher/courses/:id/edit',{id:'C-004'}],['/teacher/inbox/:id',{id:'Q-007'}]]){const {html,ctx}=p6Render(path,params);assert.equal(html,fallback('resourceDenied',ctx));assert.ok(!html.includes(name));}
+ const {html:missing,ctx:mctx}=p6Render('/teacher/course/:id',{id:'C-999'});assert.equal(missing,fallback('missing',mctx));
+ const students=p6Render('/teacher/students',{},'record=S-006').html;assert.ok(!students.includes(esc(L(student('S-006').name))),'no out-of-scope learner name');
+ dispatch('preferences.set',{role:'student'});assert.equal(select('teacher.dashboard'),null);assert.equal(dispatch('course.saveDraft',{step:'identity',values:IDENTITY}).errorKey,'p6.teacherOnly');
+});
+check('P6 earnings are derived from the ledger and match allocations (T-001 and T-003)',()=>{
+ p6Reset();const derive=teacherId=>{const rows=getState().financial_ledger_entries.filter(e=>e.teacher_id===teacherId);return acc=>rows.filter(e=>e.account===acc).reduce((n,e)=>n+e.credit_baisa-e.debit_baisa,0);};
+ const verify=teacherId=>{const e=select('teacher.earnings'),bal=derive(teacherId);
+  for(const [k,acc] of [['pending','teacher_pending'],['available','teacher_available'],['reserved','teacher_reserved'],['in_payout','teacher_in_payout']]){assert.equal(e.ledger[k],bal(acc),k);assert.equal(e.ledger[k],e.byState[k],`${teacherId} ${k} ledger = allocations`);}
+  assert.equal(e.ledger.paid,e.byState.paid,'paid');assert.equal(e.ledger.gross-e.ledger.commission,e.ledger.teacher_share);
+  assert.equal(e.ledger.teacher_share,e.sales.reduce((n,x)=>n+x.commission_snapshot.teacher_baisa,0));assert.ok(e.sales.every(x=>x.owner_teacher_id_snapshot===teacherId));return e;};
+ const t1=verify('T-001');assert.deepEqual([t1.ledger.gross,t1.ledger.commission,t1.ledger.pending,t1.ledger.available,t1.ledger.reserved,t1.ledger.paid],[85000,17000,20000,24000,24000,0]);
+ assert.deepEqual(t1.payouts.map(p=>p.id).sort(),['TP-001','TP-002']);assert.equal(t1.account.masked_iban.includes('DEMO'),true);
+ asPersona('teacher',{user_id:'U-T003',record_id:'T-003'},()=>{const t3=verify('T-003');assert.equal(t3.ledger.paid,36000);assert.ok(t3.adjustments.some(a=>a.id==='ADJ-001'&&a.original.id==='EA-006'&&a.item.id==='OI-008'&&a.original.snapshot.rate_bps===2000));assert.ok(t3.ledger.recoverable>0);});
+ for(const tab of ['sales','payables','payouts','destination'])assert.doesNotMatch(p6Render('/teacher/earnings',{},'tab='+tab).html.toLowerCase(),/wallet|محفظة/);
+ assert.equal(dispatch('payoutAccount.requestChange',{beneficiaryName:'Ahmed',accountRef:'12',consent:true}).fieldErrors.accountRef,'p6.accountRefInvalid');
+ const before=getState().teacher_payout_accounts.find(a=>a.teacher_id==='T-001').masked_iban;assert.ok(dispatch('payoutAccount.requestChange',{beneficiaryName:'Ahmed Al Harthi',accountRef:'4321',consent:'on'}).ok);
+ const acc=getState().teacher_payout_accounts.find(a=>a.teacher_id==='T-001');assert.equal(acc.masked_iban,before,'no direct edit');assert.equal(acc.change_request.state,'pending_verification');assert.ok(getState().notifications.some(n=>n.recipient_user_id==='U-F001'&&n.type==='payout_account'));
+});
+check('P6 inbox: owner assigns to active reply members; public reply, internal note hidden from learner; status transitions',()=>{
+ p6Reset();const conv=id=>getState().conversations.find(q=>q.id===id);
+ assert.equal(dispatch('conversation.assign',{conversationId:'Q-005',assigneeUserId:'U-A002'}).fieldErrors.assigneeUserId,'p6.assigneeInvalid','invited member');
+ assert.equal(dispatch('conversation.assign',{conversationId:'Q-005',assigneeUserId:'U-S001'}).fieldErrors.assigneeUserId,'p6.assigneeInvalid');
+ assert.ok(dispatch('team.assign',{memberId:'TM-001',assignments:{'C-001':['read_content','grade_assignment']}}).ok);
+ assert.equal(dispatch('conversation.assign',{conversationId:'Q-005',assigneeUserId:'U-A001'}).fieldErrors.assigneeUserId,'p6.assigneeInvalid','reply capability removed');
+ assert.ok(dispatch('team.assign',{memberId:'TM-001',assignments:{'C-001':['read_content','grade_assignment','reply_conversation']}}).ok);
+ const r=dispatch('conversation.assign',{conversationId:'Q-005',assigneeUserId:'U-A001'});assert.ok(r.ok);assert.deepEqual([conv('Q-005').state,conv('Q-005').assigned_user_id],['assigned','U-A001']);
+ assert.equal(notesFor('conversation-assigned-'+r.data.assignmentId)[0].recipient_user_id,'U-A001');
+ dispatch('preferences.set',{role:'assistant'});assert.ok(can('conversation.read',conv('Q-005')),'assistant now sees assigned Q-005');dispatch('preferences.set',{role:'teacher'});
+ assert.ok(dispatch('conversation.note',{conversationId:'Q-001',text:'Internal: give an extra diagram next time.'}).ok);assert.ok(dispatch('conversation.reply',{conversationId:'Q-001',text:'Great observation, keep a light diary.'}).ok);
+ dispatch('preferences.set',{role:'student'});const thread=select('student.thread',{id:'Q-001'});
+ assert.ok(thread.messages.some(m=>m.text==='Great observation, keep a light diary.'&&m.author_role==='teacher'));assert.ok(!JSON.stringify(thread).includes('extra diagram'),'note hidden');
+ assert.ok(!JSON.stringify(select('student.room',{courseId:'C-002'})).includes('extra diagram'));assert.ok(getState().notifications.some(n=>n.recipient_user_id==='U-S001'&&n.type==='qa_reply'&&n.href==='#/student/messages/Q-001'&&n.event_id.startsWith('reply-')));
+ dispatch('preferences.set',{role:'teacher'});
+ assert.ok(dispatch('conversation.setStatus',{conversationId:'Q-001',status:'waiting'}).ok);assert.equal(dispatch('conversation.setStatus',{conversationId:'Q-001',status:'escalated'}).errorKey,'p6.invalidTransition');
+ assert.ok(dispatch('conversation.setStatus',{conversationId:'Q-001',status:'resolved'}).ok);assert.equal(dispatch('conversation.setStatus',{conversationId:'Q-001',status:'waiting'}).errorKey,'p6.invalidTransition');
+ assert.equal(dispatch('conversation.assign',{conversationId:'Q-001',assigneeUserId:'U-T001'}).errorKey,'p6.invalidTransition','resolved');
+ assert.equal(dispatch('conversation.setStatus',{conversationId:'Q-005',status:'resolved'}).ok,true);
+ const rep=dispatch('conversation.report',{conversationId:'Q-005',messageId:getState().messages.find(m=>m.conversation_id==='Q-005').id,reason:'privacy'});assert.ok(rep.ok&&!rep.data.existing);
+ assert.ok(dispatch('conversation.report',{conversationId:'Q-005',messageId:getState().messages.find(m=>m.conversation_id==='Q-005').id,reason:'privacy'}).data.existing);
+ const trail=select('teacher.thread',{id:'Q-005'}).trail.map(e=>e.action);assert.ok(trail.includes('conversation.assign')&&trail.includes('conversation.status')&&trail.includes('conversation.report'));
+});
+check('P6 outline: add/move lessons, preview flag, publish alert deduplicated; quiz and assignment create lessons',()=>{
+ p6Reset();const mod=getState().modules.find(m=>m.course_id==='C-002'&&m.position===1),order=()=>getState().lessons.filter(l=>l.module_id===mod.id).sort((a,b)=>a.position-b.position).map(l=>l.id);
+ const first=order();assert.equal(dispatch('lesson.move',{lessonId:first[0],direction:'up'}).errorKey,'p6.cannotMove');
+ assert.ok(dispatch('lesson.move',{lessonId:first[0],direction:'down'}).ok);assert.deepEqual(order(),[first[1],first[0],first[2]]);
+ assert.ok(dispatch('lesson.update',{lessonId:first[1],preview:true}).ok);assert.equal(getState().lessons.find(l=>l.id===first[1]).preview,true);
+ assert.equal(dispatch('lesson.add',{courseId:'C-002',moduleId:mod.id,title_ar:'',title_en:'Rain',type:'reading',duration:'5',state:'ready',body:'Body text here.'}).fieldErrors.title_ar,'error.required');
+ assert.equal(dispatch('lesson.add',{courseId:'C-002',moduleId:'MOD-001',title_ar:'المطر',title_en:'Rain',type:'reading',duration:'5',state:'ready',body:'Body text here.'}).fieldErrors.moduleId,'error.required','module of another course');
+ const add=dispatch('lesson.add',{courseId:'C-002',moduleId:mod.id,title_ar:'المطر',title_en:'Rain',type:'reading',duration:'5',state:'draft',body:'Why does it rain in the mountains?'});assert.ok(add.ok);
+ assert.equal(notesFor('lesson-published-'+add.data.lessonId).length,0,'draft lesson silent');
+ assert.ok(dispatch('lesson.update',{lessonId:add.data.lessonId,state:'published'}).ok);assert.deepEqual(notesFor('lesson-published-'+add.data.lessonId).map(n=>n.recipient_user_id).sort(),['U-S001','U-S003','U-S004']);
+ assert.ok(dispatch('lesson.update',{lessonId:add.data.lessonId,state:'ready'}).ok);assert.ok(dispatch('lesson.update',{lessonId:add.data.lessonId,state:'published'}).ok);assert.equal(notesFor('lesson-published-'+add.data.lessonId).length,3,'deduplicated');
+ const q=dispatch('quiz.create',{courseId:'C-003',moduleId:getState().modules.find(m=>m.course_id==='C-003').id,title:'Ratio check',pass_score:'60',questions:[{prompt:'2:4 equals?',choices:['1:2','2:1','4:2'],correct:'0'},{prompt:'',choices:['','',''],correct:''}]});assert.ok(q.ok,JSON.stringify(q));
+ const quiz=getState().quizzes.find(x=>x.id===q.data.quizId);assert.equal(quiz.question_ids.length,1);assert.equal(getState().lessons.find(l=>l.id===quiz.lesson_id).type,'quiz');assert.equal(getState().questions.find(x=>x.id===quiz.question_ids[0]).correct_choice_id,'a');
+ assert.equal(dispatch('quiz.create',{courseId:'C-003',moduleId:'MOD-007',title:'Ratio check',pass_score:'60',questions:[{prompt:'2:4 equals?',choices:['1:2','','4:2'],correct:''}]}).fieldErrors.q0_choices,'p6.choicesRequired');
+ const a=dispatch('assignment.create',{courseId:'C-003',moduleId:'MOD-007',title:'Recipe ratios',instructions:'Scale a family recipe for 6 people.',due:'2026-11-05',max_score:'20'});assert.ok(a.ok);assert.equal(getState().assignments.find(x=>x.id===a.data.assignmentId).due_at,'2026-11-05T15:59:59Z');
+ assert.equal(dispatch('assignment.create',{courseId:'C-003',moduleId:'MOD-007',title:'Recipe ratios',instructions:'Scale a family recipe for 6 people.',due:'2026-10-01',max_score:'20'}).fieldErrors.due,'p6.dueFuture');
+ assert.ok(dispatch('resource.add',{lessonId:first[0],kind:'worksheet',title:'Plant diary',filename:'diary.txt',body:'Record growth every day.'}).ok);assert.equal(dispatch('resource.add',{lessonId:first[0],kind:'worksheet',title:'Plant diary',filename:'diary.exe',body:'Record growth every day.'}).fieldErrors.filename,'p6.resourceFileInvalid');
+ assert.ok(dispatch('announcement.post',{courseId:'C-002',title:'Bring a cup',body:'Bring a clear cup for tomorrow’s experiment.'}).ok);assert.equal(getState().notifications.filter(n=>n.type==='announcement'&&n.event_id===`announcement-${getState().announcements.at(-1).id}`).length,3);
+ assert.ok(dispatch('teacher.updateProfile',{bio_ar:'نبذة جديدة عن المعلم تشرح أسلوبه في التدريس',bio_en:'A new biography explaining the teaching approach'}).ok);dispatch('preferences.set',{role:'visitor',lang:'en'});assert.equal(select('teacher.public',{id:'T-001'}).bio.en,'A new biography explaining the teaching approach');dispatch('preferences.set',{role:'teacher',lang:'ar'});
+ assert.ok(dispatch('qualification.request',{gradeSubjectId:'GS-7-math',note:'Taught grade 7 for two years'}).ok);assert.equal(dispatch('qualification.request',{gradeSubjectId:'GS-4-math'}).fieldErrors.gradeSubjectId,'p6.alreadyQualified');
+ assert.ok(!select('teacher.editor',{}).pairs.some(p=>p.id==='GS-7-math'),'pending qualification not usable');assert.ok(select('teacher.settings').pending.some(p=>p.id==='GS-7-math'));
+});
+let p6Renders=0;
+dictionary.unknown={ar:'MISSING_DICTIONARY_KEY',en:'MISSING_DICTIONARY_KEY'};
+for(const lang of ['ar','en']){
+ p6Reset();dispatch('preferences.set',{lang});
+ const run=list=>{for(const [path,params={},query=''] of list)check(`P6 render ${lang} ${path} ${JSON.stringify(params)} ${query}`,()=>{
+  const before=getState(),{html}=p6Render(path,params,query);p6Renders++;assert.equal(getState(),before,'render is read-only');assert.ok(html.length>0);
+  assert.doesNotMatch(html,/undefined|NaN|\[object Object\]|MISSING_DICTIONARY_KEY/);assert.doesNotMatch(html.replace(/<[^>]+>/g,' '),/\b(?:p2|p3|p4|p5|p6|error|status|route)\.[\w./:-]+/);
+ });};
+ const cases=[['/teacher'],['/teacher/courses'],['/teacher/courses',{},'view=table'],['/teacher/courses',{},'status=Published'],['/teacher/courses',{},'status=Archived&view=table'],['/teacher/students'],['/teacher/students',{},'course=C-001'],['/teacher/students',{},'record=S-003'],['/teacher/students',{},'record=S-999'],['/teacher/inbox'],['/teacher/inbox/:id',{id:'Q-005'}],['/teacher/inbox/:id',{id:'Q-004'}],['/teacher/inbox/:id',{id:'Q-006'}],['/teacher/calendar'],['/teacher/calendar',{},'view=list'],['/teacher/calendar',{},'week=-1'],['/teacher/notifications'],['/teacher/notifications',{},'filter=unread'],['/teacher/earnings',{},'tab=payouts&record=TP-002'],['/teacher/earnings',{},'tab=payouts&record=TP-999'],['/teacher/course/:id',{id:'C-001'},'tab=bogus']];
+ for(const status of ['open','assigned','waiting','escalated','resolved'])cases.push(['/teacher/inbox',{},'status='+status]);
+ for(const step of teacherRoute('/teacher/courses/new').queryValues.step){cases.push(['/teacher/courses/new',{},'step='+step]);for(const id of ['C-001','C-003','C-012','C-022'])cases.push(['/teacher/courses/:id/edit',{id},'step='+step]);}
+ for(const id of ['C-001','C-002','C-003','C-012','C-022'])for(const tab of teacherRoute('/teacher/course/:id').queryValues.tab)cases.push(['/teacher/course/:id',{id},'tab='+tab]);
+ for(const [path,key] of [['/teacher/team','tab'],['/teacher/earnings','tab'],['/teacher/settings','tab']])for(const tab of teacherRoute(path).queryValues[key])cases.push([path,{},'tab='+tab]);
+ cases.push(['/teacher/courses/:id/edit',{id:'C-001'},'step=content&lesson=L-001'],['/teacher/courses/:id/edit',{id:'C-001'},'step=assessments&item=QUIZ-001'],['/teacher/courses/:id/edit',{id:'C-001'},'step=assessments&item=ASG-001'],['/teacher/course/:id',{id:'C-002'},'tab=lessons&lesson=L-011']);
+ run(cases);
+ // After authoring, grading, live and team mutations every remaining branch renders.
+ dispatch('teacher.saveForm',{name:'wizard:new:identity',values:{title_ar:'x'},fieldErrors:dispatch('course.saveDraft',{step:'identity',values:{title_ar:'x'}}).fieldErrors});
+ run([['/teacher/courses/new',{},'step=identity']]);
+ dispatch('course.saveDraft',{step:'identity',values:IDENTITY});run([['/teacher/courses/new',{},'step=academics'],['/teacher/courses/new',{},'step=review']]);
+ const id=p6Create();p6Prepare(id);dispatch('course.saveDraft',{courseId:'C-001',step:'access',values:{price_type:'paid',price:'31',access_kind:'fixed_end',access_end:'2027-06-30'}});dispatch('course.requestUnpublish',{courseId:'C-002',reason:'Updating the experiments for next term.'});
+ dispatch('preferences.set',{role:'student'});dispatch('enrollment.enrollFree',{courseId:'C-005'});dispatch('assignment.submit',{assignmentId:'ASG-004',text:'My answer to the applied task.'});dispatch('preferences.set',{role:'teacher'});
+ const sub=getState().submissions.at(-1).id;dispatch('submission.grade',{submissionId:sub,score:'7',feedback:'Good start'});
+ const ls=dispatch('live.schedule',{courseId:'C-002',title:'Rain lab',starts_at:'2026-10-26T17:00',duration:'45'}).data.sessionId;dispatch('recording.upload',{sessionId:'LS-004',filename:'plants.mp4'});
+ dispatch('conversation.note',{conversationId:'Q-005',text:'Internal follow-up'});dispatch('team.invite',{email:'helper@example.test',team_role:'content_editor',days:'30'});dispatch('payoutAccount.requestChange',{beneficiaryName:'Ahmed Al Harthi',accountRef:'4321',consent:true});dispatch('qualification.request',{gradeSubjectId:'GS-8-math'});
+ dispatch('course.saveDraft',{courseId:'C-005',step:'identity',values:{...Object.fromEntries(['title','summary','description'].flatMap(k=>[[k+'_ar',course('C-005')[k].ar],[k+'_en',course('C-005')[k].en]])),summary_en:'Updated summary for a pending revision.'}});
+ run([['/teacher'],['/teacher/courses'],['/teacher/courses/:id/edit',{id},'step=review'],['/teacher/courses/:id/edit',{id},'step=content'],['/teacher/course/:id',{id},'tab=details'],['/teacher/course/:id',{id:'C-005'},'tab=resources'],['/teacher/course/:id',{id:'C-005'},'tab=details'],['/teacher/course/:id',{id:'C-002'},'tab=live'],['/teacher/course/:id',{id:'C-002'},'tab=details'],['/teacher/course/:id',{id:'C-001'},'tab=details'],['/teacher/calendar'],['/teacher/inbox/:id',{id:'Q-005'}],['/teacher/team',{},'tab=invitations'],['/teacher/earnings',{},'tab=destination'],['/teacher/settings',{},'tab=qualifications']]);
+ dispatch('course.submit',{courseId:'C-005'});dispatch('live.cancel',{sessionId:ls});dispatch('team.revoke',{memberId:'TM-001'});
+ run([['/teacher/courses/:id/edit',{id:'C-005'},'step=identity'],['/teacher/course/:id',{id:'C-005'},'tab=details'],['/teacher/course/:id',{id:'C-002'},'tab=live'],['/teacher/team'],['/teacher/team',{},'tab=access'],['/teacher/inbox']]);
+}
+dictionary.unknown=unknownEntry;
+resetDemoData();dispatch('preferences.set',{role:'visitor',lang:'ar'});
+console.log(`P6 render smoke: ${p6Renders} renders`);
+
 console.log(`${passed} checks passed${process.exitCode ? ' (with failures above)' : ''}`);
