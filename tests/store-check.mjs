@@ -500,4 +500,109 @@ dictionary.unknown=unknownEntry;
 resetDemoData();dispatch('preferences.set',{role:'visitor',lang:'ar'});
 console.log(`P2 render smoke: ${renders} renders`);
 
+// ---------------------------------------------------------------- P3 checkout + payment invariants
+const checkoutViews=await import('../prototype/views/checkout.js');
+const {fallback}=await import('../prototype/core/layout.js');
+const {disposeOverlays:disposeCheckoutToasts}=await import('../prototype/core/ui.js');
+const p3Reset=(role='student')=>{resetDemoData();dispatch('preferences.set',{role});};
+const makeOrder=(courseId='C-001',studentId='S-001',free=false)=>dispatch(free?'checkout.activateFree':'checkout.createOrder',{courseId,studentId,consent:true});
+const sendPayment=(orderId,outcome)=>dispatch('payment.processEvent',select('checkout.event',{orderId,outcome}));
+check('P3 pending, failure, retry and success preserve item and fulfill once',()=>{
+ p3Reset('guardian');const before=getState(),created=makeOrder();assert.ok(created.ok);const id=created.data.orderId;
+ assert.equal(makeOrder().data.orderId,id);
+ const original=structuredClone(select('checkout.order',{orderId:id}).items[0]);
+ assert.equal(original.commission_snapshot.rate_bps,2000);assert.equal(original.commission_snapshot.platform_baisa,6000);assert.equal(original.commission_snapshot.teacher_baisa,24000);
+ const tx=select('checkout.order',{orderId:id}).transaction.id;
+ assert.ok(sendPayment(id,'pending').ok);assert.ok(sendPayment(id,'failure').ok);
+ for(const key of ['enrollments','access_grants','earning_allocations','financial_ledger_entries'])assert.equal(getState()[key].length,before[key].length);
+ assert.ok(dispatch('payment.retry',{orderId:id}).ok);assert.notEqual(select('checkout.order',{orderId:id}).transaction.id,tx);
+ const attempts=getState().payment_transactions.length;assert.ok(dispatch('payment.retry',{orderId:id}).ok);assert.equal(getState().payment_transactions.length,attempts);
+ const event=select('checkout.event',{orderId:id,outcome:'success'});assert.ok(dispatch('payment.processEvent',event).ok);
+ assert.ok(dispatch('payment.processEvent',event).ok);assert.ok(dispatch('payment.processEvent',event).ok);
+ assert.ok(sendPayment(id,'success').ok);assert.ok(sendPayment(id,'pending').ok);assert.ok(sendPayment(id,'failure').ok);
+ assert.equal(select('checkout.result',{orderId:id,status:'failed'}).outcome,'success');
+ assert.deepEqual(select('checkout.order',{orderId:id}).items[0],original);
+ assert.equal(getState().enrollments.length,before.enrollments.length+1);assert.equal(getState().access_grants.length,before.access_grants.length+1);assert.equal(getState().earning_allocations.length,before.earning_allocations.length+1);
+ const journal=select('checkout.ledger',{orderId:id});assert.equal(journal.length,3);assert.equal(new Set(journal.map(x=>x.journal_id)).size,1);assert.equal(journal.reduce((n,x)=>n+x.debit_baisa-x.credit_baisa,0),0);
+ assert.equal(getState().notifications.length,before.notifications.length+2);
+});
+check('P3 forged events reject atomically and success URLs are powerless',()=>{
+ p3Reset();const id=makeOrder().data.orderId;
+ assert.equal(select('checkout.result',{orderId:id,status:'success'}).outcome,'initiated');
+ const event=select('checkout.event',{orderId:id,outcome:'success'});
+ for(const patch of [{amount_baisa:1},{currency:'USD'},{order_id:'O-nope'},{beneficiary_ids:['S-002']}]){
+  const before=getState(),bad=structuredClone(event);Object.assign(bad.payload,patch);assert.equal(dispatch('payment.processEvent',bad).ok,false);assert.equal(getState(),before);
+ }
+ assert.ok(dispatch('payment.processEvent',event).ok);
+ const before=getState(),bad=structuredClone(event);bad.payload.outcome='failure';assert.equal(dispatch('payment.processEvent',bad).ok,false);assert.equal(getState(),before);
+});
+check('P3 purchase scope, explicit guardian selection, self beneficiary and buyer ownership',()=>{
+ p3Reset('guardian');assert.equal(select('checkout.context',{courseId:'C-001'}).student,null);
+ assert.deepEqual(select('checkout.context',{courseId:'C-001'}).children.map(s=>s.id),['S-001','S-002']);
+ for(const sid of ['S-003','S-004','S-005']){assert.equal(makeOrder('C-001',sid).ok,false);assert.equal(select('checkout.context',{courseId:'C-001',studentId:sid}).status,'denied');}
+ assert.equal(dispatch('checkout.createOrder',{courseId:'C-001',consent:true}).ok,false);
+ const pre=routes.find(r=>r.path==='/checkout/:courseId/beneficiary').view.render({params:{courseId:'C-001'},query:new URLSearchParams('child=S-002'),role:'guardian',actor:select('actor'),dispatch,navigate:()=>{}});
+ assert.match(pre,/value="S-002"\s+checked/);assert.doesNotMatch(pre,/S-003|S-004/);
+ const id=makeOrder().data.orderId;dispatch('preferences.set',{role:'student'});
+ assert.equal(makeOrder('C-001','S-002').ok,false);assert.equal(select('checkout.context',{courseId:'C-001'}).student.id,'S-001');
+ assert.equal(select('checkout.order',{orderId:id}).status,'denied');assert.equal(dispatch('payment.retry',{orderId:id}).ok,false);
+ assert.equal(select('checkout.context',{courseId:'C-003'}).status,'missing');assert.equal(makeOrder('C-003').ok,false);
+ assert.equal(dispatch('checkout.createOrder',{courseId:'C-001',studentId:'S-001'}).ok,false);
+});
+check('P3 teacher override and free bypass',()=>{
+ p3Reset();const id=makeOrder('C-004').data.orderId;assert.equal(select('checkout.order',{orderId:id}).items[0].commission_snapshot.rate_bps,1500);
+ const before=getState(),free=makeOrder('C-005','S-001',true);assert.ok(free.ok);assert.equal(makeOrder('C-005','S-001',true).data.orderId,free.data.orderId);
+ assert.equal(getState().payment_transactions.length,before.payment_transactions.length);assert.equal(getState().earning_allocations.length,before.earning_allocations.length);assert.equal(getState().financial_ledger_entries.length,before.financial_ledger_entries.length);
+ assert.equal(select('checkout.result',{orderId:free.data.orderId}).outcome,'success');assert.equal(getState().access_grants.at(-1).origin,'complimentary');assert.equal(getState().access_grants.at(-1).ends_at,'2027-07-31T19:59:59Z');
+ assert.equal(select('checkout.context',{courseId:'C-005'}).hasAccess,true);
+});
+check('P3 confirm without redirect action processes success and replays once',()=>{
+ p3Reset();const id=makeOrder().data.orderId;let actions;checkoutViews.registerActions((_ns,a)=>{actions=a;});
+ // Toast DOM is the only browser dependency of this action.
+ const saved=globalThis.document;globalThis.document={getElementById:()=>null};
+ try {const ctx={params:{orderId:id},dispatch,navigate:()=>assert.fail('Unexpected redirect')};actions.confirmStay(null,null,ctx);actions.confirmStay(null,null,ctx);actions.replay(null,null,ctx);}finally{disposeCheckoutToasts();globalThis.document=saved;}
+ const item=select('checkout.order',{orderId:id}).items[0];assert.equal(getState().access_grants.filter(g=>g.source_id===item.id).length,1);assert.equal(getState().earning_allocations.filter(a=>a.order_item_id===item.id).length,1);
+ const journal=select('checkout.ledger',{orderId:id});assert.equal(journal.length,3);assert.equal(new Set(journal.map(x=>x.journal_id)).size,1);
+ assert.equal(select('course.viewer',{id:'C-001'}).active,true);
+});
+check('P3 failed attempt needs retry, tamper action mutates nothing, settled order is reused',()=>{
+ p3Reset('guardian');const id=makeOrder().data.orderId;assert.ok(sendPayment(id,'failure').ok);
+ const before=getState(),late=dispatch('payment.processEvent',select('checkout.event',{orderId:id,outcome:'success'}));
+ assert.equal(late.ok,false);assert.equal(late.errorKey,'p3.retryFirst');assert.equal(getState(),before);
+ assert.ok(dispatch('payment.retry',{orderId:id}).ok);assert.equal(getState().payment_transactions.filter(x=>x.order_id===id).length,2);
+ let actions;checkoutViews.registerActions((_ns,a)=>{actions=a;});const saved=globalThis.document;globalThis.document={getElementById:()=>null};
+ try {const ctx={params:{orderId:id},dispatch,navigate:()=>assert.fail('Unexpected redirect')};const pre=getState();actions.tamper(null,null,ctx);assert.equal(getState(),pre);actions.confirmStay(null,null,ctx);}finally{disposeCheckoutToasts();globalThis.document=saved;}
+ assert.equal(select('checkout.result',{orderId:id}).outcome,'success');
+ assert.equal(select('checkout.context',{courseId:'C-001',studentId:'S-001'}).hasAccess,true);
+ assert.equal(makeOrder().data.orderId,id);assert.equal(getState().orders.filter(o=>o.id===id).length,1);
+ assert.equal(select('checkout.context',{courseId:'C-001',studentId:'S-002'}).hasAccess,false);
+ dispatch('preferences.set',{role:'student'});assert.equal(select('course.viewer',{id:'C-001'}).active,true);
+});
+let p3Renders=0;
+dictionary.unknown={ar:'MISSING_DICTIONARY_KEY',en:'MISSING_DICTIONARY_KEY'};
+for(const role of ['student','guardian'])for(const lang of ['ar','en']){
+ p3Reset(role);dispatch('preferences.set',{lang});const id=makeOrder().data.orderId;
+ for(const outcome of ['initiated','pending','failure','success']){
+  if(outcome==='success')assert.ok(dispatch('payment.retry',{orderId:id}).ok);
+  if(outcome!=='initiated')assert.ok(sendPayment(id,outcome).ok);
+  for(const route of routes.filter(r=>r.module==='checkout'))check(`P3 render ${role}/${lang}/${outcome} ${route.path}`,()=>{
+   const ctx={params:{courseId:'C-001',orderId:id},role,actor:select('actor'),route,query:new URLSearchParams({student:'S-001',status:'success'}),dispatch,navigate:()=>{}};
+   const before=getState(),html=route.view.render(ctx);p3Renders++;assert.equal(getState(),before);assert.ok(html.length);assert.doesNotMatch(html,/undefined|NaN|\[object Object\]|MISSING_DICTIONARY_KEY/);assert.doesNotMatch(html.replace(/<[^>]+>/g,' '),/\b(?:p3|error|status|route)\.[\w./:-]+/);
+  });
+ }
+ // Unselected guardian, free activation, another buyer's order and an unknown order.
+ const other=role==='student'?(dispatch('preferences.set',{role:'guardian'}),makeOrder('C-004','S-002').data.orderId):(dispatch('preferences.set',{role:'student'}),makeOrder('C-004').data.orderId);
+ dispatch('preferences.set',{role});const free=makeOrder('C-005','S-001',true).data.orderId;
+ const view=path=>routes.find(r=>r.path===path);
+ for(const [path,params,query,expect] of [['/checkout/:courseId/beneficiary',{courseId:'C-004'},'',null],['/checkout/:courseId/review',{courseId:'C-005'},'student=S-001',null],['/checkout/order/:orderId/result',{orderId:free},'',null],['/checkout/order/:orderId/receipt',{orderId:free},'',null],['/checkout/order/:orderId/provider',{orderId:other},'','resourceDenied'],['/checkout/order/:orderId/receipt',{orderId:other},'','resourceDenied'],['/checkout/order/:orderId/result',{orderId:'O-999'},'','notFound'],['/checkout/:courseId/beneficiary',{courseId:'C-003'},'','notFound']])check(`P3 render ${role}/${lang} ${path} ${JSON.stringify(params)}`,()=>{
+  const route=view(path),ctx={params,role,actor:select('actor'),route,query:new URLSearchParams(query),dispatch,navigate:()=>{}};
+  const html=route.view.render(ctx);p3Renders++;assert.doesNotMatch(html,/undefined|NaN|\[object Object\]|MISSING_DICTIONARY_KEY/);
+  if(expect)assert.equal(html,fallback(expect,ctx));
+  else if(role==='guardian'&&path.endsWith('beneficiary'))assert.doesNotMatch(html,/<input[^>]*\schecked/,'no implicit child');
+ });
+}
+dictionary.unknown=unknownEntry;
+resetDemoData();dispatch('preferences.set',{role:'visitor',lang:'ar'});
+console.log(`P3 render smoke: ${p3Renders} renders`);
+
 console.log(`${passed} checks passed${process.exitCode ? ' (with failures above)' : ''}`);

@@ -151,8 +151,7 @@ export const subject={render(ctx) {const pair=select('gradeSubject',ctx.params);
 function purchase(c,ctx) {
  const viewer=select('course.viewer',{id:c.id});
  if(viewer.active)return button({label:label('goCourse'),href:'#/student/course/'+c.id});
- if(c.price_type==='free'&&ctx.role==='student')return button({label:label('enroll'),action:'public.enroll',data:{id:c.id}});
- const target=c.price_type==='free'?'#/course/'+c.id:'#/checkout/'+c.id+'/beneficiary';
+ const target='#/checkout/'+c.id+'/beneficiary';
  const href=ctx.role==='visitor'?'#/auth/sign-in?return='+encodeURIComponent(target):'#/checkout/'+c.id+'/beneficiary';
  return button({label:label(c.price_type==='free'?'enroll':'buy'),href});
 }

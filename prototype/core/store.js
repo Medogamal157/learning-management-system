@@ -155,6 +155,7 @@ export function can(action,resource={}) {
  const module=r.module ?? (action.startsWith('finance.')?'finance':action.startsWith('people.')?'people':null);
  if(action==='public.read')return course?publicCourse(course):true;
  if(role==='visitor')return false;
+ if(action==='order.read'&&['student','guardian'].includes(role))return r.buyer_user_id===actor.user_id;
  if(module) {
   if(!['finance','people','academics','courses','support','cms','settings','notifications','reports'].includes(module))return false;
   if(role==='super_admin' || (role==='admin_finance' && module==='finance'))return !action.includes('approve_payout') || r.prepared_by!==actor.user_id;
@@ -264,3 +265,120 @@ export function select(selector,args={}) {
  default: throw new Error(`Unknown selector: ${selector}`);
  }
 }
+
+// P3 checkout: integer-baisa snapshots and append-only fulfillment records.
+const ACCESS_END='2027-07-31T19:59:59Z';
+function purchaseStudent(s,actor,id) {
+ if(s.preferences.role==='student')return id===actor.record_id;
+ return s.preferences.role==='guardian' && s.guardian_student_links.some(l=>l.guardian_id===actor.record_id&&l.student_id===id&&l.state==='verified'&&l.scopes.includes('purchase'));
+}
+function checkoutContext(s,{courseId,studentId},{actor}) {
+ const course=s.courses.find(c=>c.id===courseId);
+ if(!course||!isPublic(s,course))return {status:'missing'};
+ if(!['student','guardian'].includes(s.preferences.role))return {status:'denied'};
+ const children=s.students.filter(x=>purchaseStudent(s,actor,x.id)).map(x=>({id:x.id,name:x.name,grade:s.grades.find(g=>g.id===x.current_grade_id)?.name??null}));
+ const sid=studentId??(s.preferences.role==='student'?actor.record_id:null);
+ if(sid&&!purchaseStudent(s,actor,sid))return {status:'denied'};
+ const student=children.find(x=>x.id===sid)??null;
+ return {status:'ok',course:publicView(course),buyer:s.users.find(u=>u.id===actor.user_id),children,student,hasAccess:!!student&&!!activeGrantIn(s,sid,courseId),accessEnd:ACCESS_END};
+}
+function ownedOrder(s,id,actor) {
+ const order=s.orders.find(o=>o.id===id);
+ if(!order)return {status:'missing'};
+ if(!['student','guardian'].includes(s.preferences.role)||order.buyer_user_id!==actor.user_id)return {status:'denied'};
+ const items=s.order_items.filter(i=>i.order_id===id).map(i=>({...i,beneficiary_name:i.beneficiary_name_snapshot??s.students.find(x=>x.id===i.beneficiary_student_id)?.name}));
+ const transactions=s.payment_transactions.filter(x=>x.order_id===id).sort((a,b)=>a.attempt_no-b.attempt_no);
+ return {status:'ok',order,items,transactions,transaction:transactions.at(-1)??null,buyer:s.users.find(u=>u.id===actor.user_id),outcome:order.state==='paid'?'success':order.state==='failed'?'failure':order.state==='pending'?'pending':order.state==='draft'?'initiated':order.state};
+}
+function commission(s,c,base) {
+ const priority={campaign:3,teacher:2,default:1};
+ const rule=s.commission_rules.filter(r=>r.active&&r.active_from<=DEMO_NOW&&(!r.active_until||r.active_until>DEMO_NOW)&&(!r.course_id||r.course_id===c.id)&&(!r.teacher_id||r.teacher_id===c.owner_teacher_id)).sort((a,b)=>(priority[b.scope]??0)-(priority[a.scope]??0)||b.version-a.version||b.active_from.localeCompare(a.active_from))[0];
+ if(!rule||!Number.isInteger(rule.rate_bps)||rule.rate_bps<0||rule.rate_bps>10000)return null;
+ const platform=Math.round(base*rule.rate_bps/10000);
+ return {rule_id:rule.id,version:rule.version,base_baisa:base,rate_bps:rule.rate_bps,platform_baisa:platform,teacher_baisa:base-platform};
+}
+function newAttempt(s,order) {
+ const attempts=s.payment_transactions.filter(x=>x.order_id===order.id),id=nextId(s.payment_transactions,'PAY');
+ const tx={id,order_id:order.id,provider_ref:'DEMO-'+id,attempt_no:Math.max(0,...attempts.map(x=>x.attempt_no))+1,state:'initiated',amount_baisa:order.total_baisa,currency:order.currency,confirmed_at:null,verified_demo:false,created_at:DEMO_NOW,updated_at:DEMO_NOW};
+ s.payment_transactions.push(tx);return tx;
+}
+function fulfill(s,order,item,free=false) {
+ // A settled item is never fulfilled again, even after its grant expires or is refunded.
+ if(s.access_grants.some(g=>g.source_id===item.id)||s.earning_allocations.some(a=>a.order_item_id===item.id))return;
+ const student=s.students.find(x=>x.id===item.beneficiary_student_id);
+ let enrollment=s.enrollments.find(e=>e.student_id===student.id&&e.course_id===item.course_id);
+ if(!enrollment){enrollment={id:nextId(s.enrollments,'EN'),student_id:student.id,course_id:item.course_id,status:'active',started_at:DEMO_NOW,historical_grade_id:student.current_grade_id,created_at:DEMO_NOW,updated_at:DEMO_NOW};s.enrollments.push(enrollment);}
+ s.access_grants.push({id:nextId(s.access_grants,'AG'),student_id:student.id,course_id:item.course_id,enrollment_id:enrollment.id,origin:free?'complimentary':'one_time_purchase',source_id:item.id,starts_at:DEMO_NOW,ends_at:item.access_end_snapshot??ACCESS_END,status:'active',created_at:DEMO_NOW,updated_at:DEMO_NOW});
+ if(!free){
+  const snap=item.commission_snapshot;
+  s.earning_allocations.push({id:nextId(s.earning_allocations,'EA'),order_item_id:item.id,teacher_id:item.owner_teacher_id_snapshot,snapshot:structuredClone(snap),amount_baisa:snap.teacher_baisa,state:'pending',original_allocation_id:null,hold_reason:{ar:'فترة انتظار تجريبية',en:'Demo hold'},eligible_at:'2026-10-26T08:00:00Z',created_at:DEMO_NOW,updated_at:DEMO_NOW});
+  for(const [account,debit,credit] of [['provider_clearing',item.total_baisa,0],['platform_commission',0,snap.platform_baisa],['teacher_pending',0,snap.teacher_baisa]])s.financial_ledger_entries.push({id:nextId(s.financial_ledger_entries,'LE'),journal_id:'J-SALE-'+item.id,account,teacher_id:item.owner_teacher_id_snapshot,source_type:'order_item',source_id:item.id,debit_baisa:debit,credit_baisa:credit,currency:'OMR',created_at:DEMO_NOW,reversal_of:null});
+ }
+ for(const recipient of new Set([order.buyer_user_id,student.user_id])){
+  const n={id:nextId(s.notifications,'N'),recipient_user_id:recipient,event_id:'checkout-'+item.id,type:'enrollment',title:{ar:'تم تفعيل الوصول للدورة',en:'Course access activated'},body:structuredClone(item.title_snapshot),href:recipient===student.user_id?'#/student/course/'+item.course_id:'#/guardian/child/'+student.id,read_at:null,related_course_id:item.course_id,created_at:DEMO_NOW};s.notifications.push(n);
+  s.delivery_attempts.push({id:nextId(s.delivery_attempts,'DA'),notification_id:n.id,channel:'in_app',state:'sent',attempts:1,last_error:null,created_at:DEMO_NOW,updated_at:DEMO_NOW});
+ }
+}
+function createCheckout(s,p,{actor},free=false) {
+ const c=checkoutContext(s,p,{actor});
+ if(c.status!=='ok')return fail(c.status==='missing'?'error.courseUnavailable':'resourceDenied');
+ if(!c.student)return fail('p3.chooseStudent');
+ if(p.consent!==true&&p.consent!=='on')return fail('error.consent');
+ if((c.course.price_type==='free')!==free)return fail('p3.invalidCheckout');
+ // Repeated confirmation reuses this buyer's unsettled order, or the settled order behind current access.
+ // A paid order whose access has lapsed is history; it never blocks a new purchase.
+ const previous=s.orders.filter(o=>o.buyer_user_id===actor.user_id&&(c.hasAccess?o.state==='paid':['draft','pending','failed'].includes(o.state))&&s.order_items.some(i=>i.order_id===o.id&&i.course_id===p.courseId&&i.beneficiary_student_id===c.student.id&&(!c.hasAccess||s.access_grants.some(g=>g.source_id===i.id&&g.status==='active')))).at(-1);
+ if(previous)return ok({orderId:previous.id});
+ if(c.hasAccess)return fail('p3.already');
+ const enrollment=s.enrollments.find(e=>e.student_id===c.student.id&&e.course_id===p.courseId);
+ if(enrollment&&enrollment.status!=='active')return fail('error.enrollmentSuspended');
+ const price=free?0:c.course.price_baisa,snapshot=commission(s,c.course,price);
+ if(!snapshot||!Number.isInteger(price)||price<0||(!free&&price===0))return fail('p3.invalidCheckout');
+ const order={id:nextId(s.orders,'O'),buyer_user_id:actor.user_id,state:free?'paid':'draft',currency:'OMR',subtotal_baisa:price,discount_baisa:0,tax_baisa:0,total_baisa:price,created_at:DEMO_NOW,updated_at:DEMO_NOW};
+ const item={id:nextId(s.order_items,'OI'),order_id:order.id,course_id:c.course.id,beneficiary_student_id:c.student.id,beneficiary_name_snapshot:structuredClone(c.student.name),title_snapshot:structuredClone(c.course.title),owner_teacher_id_snapshot:c.course.owner_teacher_id,price_baisa:price,discount_baisa:0,tax_baisa:0,total_baisa:price,commission_snapshot:snapshot,access_end_snapshot:ACCESS_END,created_at:DEMO_NOW};
+ s.orders.push(order);s.order_items.push(item);
+ if(free)fulfill(s,order,item,true);else newAttempt(s,order);
+ return ok({orderId:order.id});
+}
+Object.assign(reducers,{
+ 'checkout.createOrder':(s,p,ctx)=>createCheckout(s,p,ctx),
+ 'checkout.activateFree':(s,p,ctx)=>createCheckout(s,p,ctx,true),
+ 'payment.retry':(s,p,{actor})=>{
+  const d=ownedOrder(s,p.orderId,actor);if(d.status!=='ok')return fail(d.status==='missing'?'missing':'resourceDenied');
+  if(d.transaction?.state==='initiated')return ok({transactionId:d.transaction.id,orderId:d.order.id});
+  if(d.order.state!=='failed'||d.transaction?.state!=='failed')return fail('p3.invalidCheckout');
+  const tx=newAttempt(s,d.order);d.order.state='draft';d.order.updated_at=DEMO_NOW;return ok({transactionId:tx.id,orderId:d.order.id});
+ },
+ 'payment.processEvent':(s,event,{actor})=>{
+  const tx=s.payment_transactions.find(x=>x.id===event.payment_transaction_id),p=event.payload;
+  if(!tx||!p||typeof event.event_id!=='string'||!/^DEMO-[A-Za-z0-9-]{1,100}$/.test(event.event_id))return fail('p3.eventRejected');
+  const d=ownedOrder(s,tx.order_id,actor);if(d.status!=='ok')return fail('resourceDenied');
+  const ids=d.items.map(i=>i.beneficiary_student_id).sort();
+  if(p.order_id!==tx.order_id||p.currency!=='OMR'||p.currency!==tx.currency||!Number.isInteger(p.amount_baisa)||p.amount_baisa!==tx.amount_baisa||p.amount_baisa!==d.order.total_baisa||!Array.isArray(p.beneficiary_ids)||JSON.stringify([...p.beneficiary_ids].sort())!==JSON.stringify(ids)||!['success','pending','failure'].includes(p.outcome))return fail('p3.eventRejected');
+  const old=s.provider_events.find(e=>e.event_id===event.event_id);
+  if(old)return old.payment_transaction_id===tx.id&&JSON.stringify(old.payload)===JSON.stringify(p)?ok({orderId:d.order.id,replayed:true}):fail('p3.eventRejected');
+  // Historical refunded orders cannot be resurrected by the simulator.
+  if(!['draft','pending','failed','paid'].includes(d.order.state))return fail('p3.invalidCheckout');
+  // A failed attempt is final: only a retry (new transaction) may carry further outcomes.
+  if(tx.state==='failed')return fail('p3.retryFirst');
+  s.provider_events.push({id:nextId(s.provider_events,'PE'),event_id:event.event_id,payment_transaction_id:tx.id,payload:structuredClone(p),verified_demo:true,processed_at:DEMO_NOW,created_at:DEMO_NOW});
+  if(d.order.state==='paid'||tx.state==='succeeded')return ok({orderId:d.order.id,settled:true});
+  if(p.outcome==='success'){
+   d.order.state='paid';tx.state='succeeded';tx.confirmed_at=DEMO_NOW;
+   for(const item of d.items)fulfill(s,d.order,item);
+  }else if(tx.id===d.transaction.id){d.order.state=p.outcome==='pending'?'pending':'failed';tx.state=d.order.state;}
+  tx.verified_demo=true;tx.updated_at=DEMO_NOW;d.order.updated_at=DEMO_NOW;
+  return ok({orderId:d.order.id});
+ }
+});
+registerSelectors({
+ 'checkout.context':checkoutContext,
+ 'checkout.order':(s,a,{actor})=>ownedOrder(s,a.orderId,actor),
+ 'checkout.result':(s,a,{actor})=>ownedOrder(s,a.orderId,actor),
+ 'checkout.ledger':(s,a,{actor})=>{const d=ownedOrder(s,a.orderId,actor);return d.status==='ok'?s.financial_ledger_entries.filter(e=>e.source_type==='order_item'&&d.items.some(i=>i.id===e.source_id)):[];},
+ 'checkout.event':(s,a,{actor})=>{
+  const d=ownedOrder(s,a.orderId,actor);if(d.status!=='ok'||!d.transaction)return null;
+  if(a.replay)return s.provider_events.filter(e=>e.payment_transaction_id===d.transaction.id).at(-1)??null;
+  return {event_id:'DEMO-CHECKOUT-'+nextId(s.provider_events,'PE'),payment_transaction_id:d.transaction.id,payload:{order_id:d.order.id,beneficiary_ids:d.items.map(i=>i.beneficiary_student_id),amount_baisa:d.order.total_baisa,currency:d.order.currency,outcome:a.outcome}};
+ }
+});
