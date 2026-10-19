@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#0F766E">
 <meta name="description" content="منصة عُمان التعليمية — تصور تفاعلي ببيانات اصطناعية · Oman Learning Platform — interactive concept with synthetic data">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230F766E'/%3E%3Cpath d='m5 13 11-6 11 6-11 6ZM9 16v6q7 5 14 0v-6M27 13v9' fill='none' stroke='%23fff6df' stroke-width='2' stroke-linejoin='round'/%3E%3C/svg%3E">
 <title>منصة عُمان التعليمية</title>
 <script>
   // Apply persisted, validated preferences before first paint; storage may be unavailable.
@@ -295,6 +296,14 @@
     .page-main { padding: 0; }
     .print-receipt { display: block; }
   }
+  /* P2 marketplace and authentication */
+  .catalog-layout,.course-layout,.course-hero{display:grid;gap:24px;margin-block:24px;min-width:0}
+  .auth-shell{max-width:720px;margin-inline:auto}.auth-shell fieldset{min-width:0}
+  .sample-stage{min-height:240px;display:grid;place-content:center;gap:20px;text-align:center;padding:24px;border-radius:16px;background:var(--sand)}
+  .sample-stage svg{margin-inline:auto}.sample-stage p{max-width:55ch}
+  .purchase-card{align-self:start}.mobile-purchase{position:fixed;inset-inline:0;inset-block-end:0;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:12px;padding-inline-end:88px;padding-block-end:calc(12px + env(safe-area-inset-bottom));background:var(--surface);border-block-start:1px solid var(--border);z-index:30}
+  .mobile-purchase .btn{min-width:0}.page-main{padding-block-end:120px}
+  @media(min-width:1024px){.catalog-layout{grid-template-columns:250px minmax(0,1fr)}.course-hero{grid-template-columns:minmax(0,1.4fr) minmax(0,1fr);align-items:center}.course-layout{grid-template-columns:minmax(0,1fr) 300px}.purchase-card{position:sticky;inset-block-start:100px}.mobile-purchase{display:none}}
 </style>
 </head>
 <body>

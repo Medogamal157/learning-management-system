@@ -404,4 +404,100 @@ check('money() formats 3 decimals in both languages', () => {
   assert.equal(t('route./'), 'الرئيسية');
 });
 
+
+// P2 behavior and rendering: no DOM or listening socket required.
+check('P2 catalog filters exclude every non-public course', () => {
+  resetDemoData(); as('visitor');
+  for (const c of getState().courses) assert.equal(!!select('course.public',{id:c.id}),c.status==='Published');
+  const rows=select('catalog.search',{grade:'4',subject:'math'});
+  assert.ok(rows.length); assert.ok(rows.every(c=>c.grade.id==='4'&&c.subject.id==='math'));
+  assert.ok(select('catalog.search',{price:'free'}).every(c=>c.price_type==='free'));
+  assert.ok(select('catalog.search',{max:'0'}).every(c=>c.price_baisa===0));
+  assert.equal(select('catalog.search',{q:'impossible-result'}).length,0);
+  assert.equal(select('gradeSubject',{gradeId:'4',subjectId:'physics'}),null);
+  assert.ok(select('teacher.public',{id:'T-001'}).courses.every(c=>c.status==='Published'));
+  assert.equal(select('teacher.public',{id:'T-004'}),null);
+  const locked=select('course.public',{id:'C-001'}).modules.flatMap(m=>m.lessons).find(l=>l.id==='L-002');
+  assert.equal(select('course.public',{id:'C-001'}).pending_revision,undefined);
+  assert.equal(locked.preview,false); assert.equal(locked.body,undefined); assert.equal(locked.transcript,undefined);
+});
+check('P2 free enrollment is scoped, atomic and idempotent', () => {
+  as('visitor');assert.equal(dispatch('enrollment.enrollFree',{courseId:'C-005'}).ok,false);
+  as('guardian');assert.equal(dispatch('enrollment.enrollFree',{courseId:'C-005'}).ok,false);
+  as('student');
+  assert.equal(dispatch('enrollment.enrollFree',{courseId:'C-001'}).ok,false);
+  assert.equal(dispatch('enrollment.enrollFree',{courseId:'C-003'}).ok,false);
+  const before=getState(),r=dispatch('enrollment.enrollFree',{courseId:'C-005'});assert.ok(r.ok);
+  assert.equal(getState().enrollments.length,before.enrollments.length+1);
+  assert.equal(getState().access_grants.length,before.access_grants.length+1);
+  assert.equal(getState().access_grants.find(g=>g.id===r.data.grant_id).origin,'complimentary');
+  assert.ok(can('read_content',course('C-005')));
+  const twice=dispatch('enrollment.enrollFree',{courseId:'C-005'});assert.ok(twice.ok&&twice.data.existing);
+  assert.equal(twice.data.grant_id,r.data.grant_id);assert.equal(getState().orders.length,before.orders.length);
+  assert.equal(getState().financial_ledger_entries.length,before.financial_ledger_entries.length);
+});
+check('P2 contact creates an owned ticket, anonymous contact creates none',()=>{
+ const values={topic:'account',subject:'Demo question',body:'A synthetic message for help.',email:'visitor@example.test'};
+ as('student');const before=getState().support_tickets.length,r=dispatch('support.createTicket',values);assert.ok(r.ok);
+ const ticket=getState().support_tickets.find(x=>x.id===r.data.ticketId);assert.equal(ticket.requester_user_id,'U-S001');assert.equal(ticket.state,'open');
+ as('visitor');assert.ok(dispatch('support.createTicket',values).ok);assert.equal(getState().support_tickets.length,before+1);
+ assert.equal(dispatch('support.createTicket',{...values,email:'bad'}).ok,false);
+});
+check('P2 auth validates form and rejects external or unauthorized returns',()=>{
+ const values={email:'demo@example.test',password:'demo',persona:'guardian'};
+ assert.equal(dispatch('auth.signIn',{...values,email:'bad'}).ok,false);
+ assert.equal(dispatch('auth.signIn',{...values,returnTo:'#/checkout/C-001/beneficiary'}).data.hash,'#/checkout/C-001/beneficiary');
+ for(const returnTo of ['https://example.test','#//example.test','#/admin','#/teacher/course/C-001','#/student/course/C-002','#/checkout/../admin','#/auth/sign-in'])assert.equal(dispatch('auth.signIn',{...values,returnTo}).data.hash,'#/guardian');
+ assert.ok(dispatch('auth.registerGuardian',{name:'Demo Guardian',contact:'guardian@example.test',consent:true}).ok);
+ assert.ok(dispatch('auth.registerStudent',{name:'Demo Student',email:'student@example.test',grade:'4',consent:true}).ok);
+ assert.equal(JSON.stringify(getState().transient).includes('password'),false);
+});
+
+// Isolated seeds exercise reviewer-controlled states without introducing a P2 moderation action.
+const {readFile}=await import('node:fs/promises');
+const storeSource=await readFile(new URL('../prototype/core/store.js',import.meta.url),'utf8');
+for(const initial of ['draft_application','submitted','more_info_required','rejected','under_review']) {
+ const fixtureSource=storeSource.replace("'./data.js'",JSON.stringify(new URL('../prototype/core/data.js',import.meta.url).href)).replaceAll('...createSeed()','...fixtureSeed()')+`\nfunction fixtureSeed(){const s=createSeed();s.teacher_applications.find(a=>a.teacher_id==='T-004').state=${JSON.stringify(initial)};return s;}`;
+ const isolated=await import('data:text/javascript;base64,'+Buffer.from(fixtureSource).toString('base64'));
+ check('P2 application transition from '+initial,()=>{
+  isolated.dispatch('preferences.set',{role:'visitor'});
+  const d=(type,payload)=>isolated.dispatch(type,payload),editable=['draft_application','submitted','more_info_required'].includes(initial);
+  assert.equal(d('application.saveStep',{step:'identity',values:{name:'Demo Teacher',email:'teacher@example.test',bio:'A synthetic teaching biography with experience.'}}).ok,editable);
+  if(!editable){assert.equal(d('application.submit',{consent:true}).ok,false);return;}
+  assert.equal(d('application.submit',{consent:true}).ok,false,'missing credentials rejected');
+  assert.ok(d('application.saveStep',{step:'qualifications',values:{pairs:['GS-4-math','GS-5-science']}}).ok);
+  assert.ok(d('application.saveStep',{step:'credentials',values:{credentials:[{label:'Teaching licence',filename:'license.pdf'}]}}).ok);
+  const r=d('application.submit',{consent:true});assert.ok(r.ok,JSON.stringify(r));assert.equal(r.data.state,'submitted');
+  assert.equal(isolated.select('application.current').application.state,'submitted');
+  assert.equal(isolated.select('teacher.public',{id:'T-004'}),null);
+  isolated.dispatch('preferences.set',{role:'student'});assert.equal(d('application.submit',{consent:true}).ok,false);
+ });
+}
+
+let renders=0;
+const unknownEntry=dictionary.unknown;
+dictionary.unknown={ar:'MISSING_DICTIONARY_KEY',en:'MISSING_DICTIONARY_KEY'};
+resetDemoData();
+for(const role of ['visitor','student','guardian'])for(const lang of ['ar','en']) {
+ dispatch('preferences.set',{role,lang});
+ for(const route of routes.filter(r=>r.phase<=2)) {
+  const params={gradeId:'4',subjectId:'math',id:route.path==='/teacher/:id'?'T-001':'C-001',page:'privacy'};
+  const path=route.path.replace(/:(\w+)/g,(_,key)=>params[key]);
+  const variants=[new URLSearchParams()];
+  for(const [key,values]of Object.entries(route.queryValues))for(const value of values)variants.push(new URLSearchParams({[key]:value}));
+  if(route.path==='/legal/:page')for(const page of ['terms','refunds','bad'])variants.push(new URLSearchParams({testPage:page}));
+  if(route.path==='/explore')variants.push(new URLSearchParams({tab:'courses',q:'no-matches',page:'999'}));
+  for(const query of variants)check(`P2 render ${role}/${lang} ${path}?${query}`,()=>{
+   const ctx={role,actor:select('actor'),route,params:{...params,page:query.get('testPage')??params.page},path,query,navigate:()=>{},dispatch};
+   const html=route.view.render(ctx);renders++;
+   assert.ok(html.length>0);assert.doesNotMatch(html,/undefined|\[object Object\]|NaN|MISSING_DICTIONARY_KEY/);
+   const visible=html.replace(/<[^>]+>/g,' ');
+   assert.doesNotMatch(visible,/\b(?:p2|error|route|status)\.[\w./:-]+/);
+  });
+ }
+}
+dictionary.unknown=unknownEntry;
+resetDemoData();dispatch('preferences.set',{role:'visitor',lang:'ar'});
+console.log(`P2 render smoke: ${renders} renders`);
+
 console.log(`${passed} checks passed${process.exitCode ? ' (with failures above)' : ''}`);

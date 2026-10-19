@@ -1295,6 +1295,561 @@ export const dictionary = {
   "home.collageLive": { "ar": "حصة مباشرة الثلاثاء", "en": "Live class on Tuesday" }
 };
 
+Object.assign(dictionary, {
+  "p2.sections": {
+    "ar": "أقسام الصفحة",
+    "en": "Page sections"
+  },
+  "p2.missing": {
+    "ar": "هذه الصفحة غير متاحة",
+    "en": "This page is unavailable"
+  },
+  "p2.missingBody": {
+    "ar": "تحقق من الصف والمادة أو استكشف الدورات المنشورة.",
+    "en": "Check the grade and subject, or explore published courses."
+  },
+  "p2.empty": {
+    "ar": "لا توجد نتائج مطابقة",
+    "en": "No matching results"
+  },
+  "p2.emptyBody": {
+    "ar": "جرّب تغيير المرشحات أو إعادة ضبطها.",
+    "en": "Try adjusting or resetting the filters."
+  },
+  "p2.search": {
+    "ar": "بحث",
+    "en": "Search"
+  },
+  "p2.curriculum": {
+    "ar": "المنهج",
+    "en": "Curriculum"
+  },
+  "p2.year": {
+    "ar": "العام الدراسي",
+    "en": "Academic year"
+  },
+  "p2.grade": {
+    "ar": "الصف",
+    "en": "Grade"
+  },
+  "p2.subject": {
+    "ar": "المادة / الموضوع",
+    "en": "Subject"
+  },
+  "p2.teacher": {
+    "ar": "المعلم",
+    "en": "Teacher"
+  },
+  "p2.semester": {
+    "ar": "الفصل الدراسي",
+    "en": "Semester"
+  },
+  "p2.language": {
+    "ar": "اللغة",
+    "en": "Language"
+  },
+  "p2.mode": {
+    "ar": "نوع الدورة",
+    "en": "Format"
+  },
+  "p2.price": {
+    "ar": "مجانية أو مدفوعة",
+    "en": "Free or paid"
+  },
+  "p2.availability": {
+    "ar": "التوفر",
+    "en": "Availability"
+  },
+  "p2.max": {
+    "ar": "السعر الأقصى (بيسة)",
+    "en": "Maximum price (baisa)"
+  },
+  "p2.ar": {
+    "ar": "العربية",
+    "en": "Arabic"
+  },
+  "p2.en": {
+    "ar": "الإنجليزية",
+    "en": "English"
+  },
+  "p2.recorded": {
+    "ar": "مسجلة",
+    "en": "Recorded"
+  },
+  "p2.live": {
+    "ar": "مباشرة",
+    "en": "Live"
+  },
+  "p2.hybrid": {
+    "ar": "مدمجة",
+    "en": "Hybrid"
+  },
+  "p2.free": {
+    "ar": "مجانية",
+    "en": "Free"
+  },
+  "p2.paid": {
+    "ar": "مدفوعة",
+    "en": "Paid"
+  },
+  "p2.preview": {
+    "ar": "معاينة",
+    "en": "Preview"
+  },
+  "p2.grades": {
+    "ar": "الصفوف",
+    "en": "Grades"
+  },
+  "p2.subjects": {
+    "ar": "المواد",
+    "en": "Subjects"
+  },
+  "p2.courses": {
+    "ar": "الدورات",
+    "en": "Courses"
+  },
+  "p2.catalogIntro": {
+    "ar": "ابدأ بصفك، واختر المادة وطريقة التعلم المناسبة لك.",
+    "en": "Start with your grade, then find your subject and learning format."
+  },
+  "p2.goCourse": {
+    "ar": "اذهب إلى الدورة",
+    "en": "Go to course"
+  },
+  "p2.enroll": {
+    "ar": "التحق مجاناً",
+    "en": "Enroll free"
+  },
+  "p2.buy": {
+    "ar": "اشترِ الدورة",
+    "en": "Buy course"
+  },
+  "p2.prerequisites": {
+    "ar": "المتطلبات السابقة",
+    "en": "Prerequisites"
+  },
+  "p2.simulated": {
+    "ar": "مشغّل توضيحي متحرك؛ لا يتم بث فيديو حقيقي ولا يُسجّل تقدم دراسي.",
+    "en": "Animated demo player; no real video is streamed and no learning progress is recorded."
+  },
+  "p2.timeline": {
+    "ar": "خط المعاينة الزمني",
+    "en": "Preview timeline"
+  },
+  "p2.play": {
+    "ar": "تشغيل",
+    "en": "Play"
+  },
+  "p2.pause": {
+    "ar": "إيقاف مؤقت",
+    "en": "Pause"
+  },
+  "p2.captions": {
+    "ar": "إظهار / إخفاء الترجمة",
+    "en": "Toggle captions"
+  },
+  "p2.transcript": {
+    "ar": "النص المكتوب",
+    "en": "Transcript"
+  },
+  "p2.lockedBody": {
+    "ar": "هذا الدرس مقفل. اشترِ الدورة أو التحق بالدورة المجانية للوصول إلى المحتوى من مساحة الطالب. المعاينة لا تنشئ التحاقاً.",
+    "en": "This lesson is locked. Purchase the course or enroll in a free course to access content in the student workspace. Previewing does not enroll you."
+  },
+  "p2.noLive": {
+    "ar": "هذه الدورة لا تتضمن حصصاً مباشرة معلنة حالياً.",
+    "en": "No live sessions are currently announced for this course."
+  },
+  "p2.accessBody": {
+    "ar": "الوصول مرتبط بالطالب حتى نهاية الفترة الموضحة. الدورات المجانية تتطلب التحاقاً لتتبع التقدم.",
+    "en": "Access belongs to the enrolled learner until the date shown. Free courses require enrollment to track progress."
+  },
+  "p2.reviewsBody": {
+    "ar": "التقييمات معطّلة حتى اعتماد سياسة المراجعات. لا توجد تقييمات أو مراجعات تجريبية مصطنعة.",
+    "en": "Reviews are disabled until the review policy is approved. No ratings or reviews have been invented."
+  },
+  "p2.lapsed": {
+    "ar": "انتهى الوصول السابق أو أُلغي. راجع المساعدة لاستعادة الوصول أو تابع الشراء.",
+    "en": "Previous access expired or was revoked. Contact help for recovery or continue to purchase."
+  },
+  "p2.overview": {
+    "ar": "نظرة عامة",
+    "en": "Overview"
+  },
+  "p2.outcomes": {
+    "ar": "مخرجات التعلم",
+    "en": "Learning outcomes"
+  },
+  "p2.syllabus": {
+    "ar": "محتوى الدورة",
+    "en": "Syllabus"
+  },
+  "p2.schedule": {
+    "ar": "الجدول",
+    "en": "Schedule"
+  },
+  "p2.access": {
+    "ar": "السعر والوصول",
+    "en": "Pricing and access"
+  },
+  "p2.reviews": {
+    "ar": "التقييمات",
+    "en": "Reviews"
+  },
+  "p2.about": {
+    "ar": "نبذة",
+    "en": "About"
+  },
+  "p2.teacherIntro": {
+    "ar": "تعرف على المعلمين ومؤهلاتهم الموثقة ودوراتهم المنشورة.",
+    "en": "Meet teachers, their verified qualifications and published courses."
+  },
+  "p2.becomeIntro": {
+    "ar": "شارك خبرتك مع طلبة عُمان ضمن صفوف ومواد واضحة.",
+    "en": "Share your expertise with Omani learners through clear grade and subject pathways."
+  },
+  "p2.benefits": {
+    "ar": "علّم بأسلوبك",
+    "en": "Teach your way"
+  },
+  "p2.benefitsBody": {
+    "ar": "اجمع الدروس المسجلة والحصص المباشرة والأنشطة في مساحة تعلم واحدة.",
+    "en": "Bring recorded lessons, live sessions and activities together in one learning space."
+  },
+  "p2.process": {
+    "ar": "خطوات الانضمام",
+    "en": "How to join"
+  },
+  "p2.processBody": {
+    "ar": "أكمل بياناتك، وحدد الصفوف والمواد، ثم قدّم المؤهلات للمراجعة. الاعتماد يسبق نشر الدورات.",
+    "en": "Complete your identity, choose grade-subject pairs and submit credentials for review. Approval comes before course publication."
+  },
+  "p2.checklist": {
+    "ar": "جهّز طلبك",
+    "en": "Prepare your application"
+  },
+  "p2.checklistBody": {
+    "ar": "نبذة تعليمية، بريد تجريبي، مؤهل مناسب لكل صف ومادة، وأسماء ملفات المستندات التجريبية.",
+    "en": "Prepare a teaching bio, demo email, qualifications for each grade and subject, and synthetic document filenames."
+  },
+  "p2.applyTitle": {
+    "ar": "ابدأ طلب التدريس",
+    "en": "Start a teacher application"
+  },
+  "p2.policyNotice": {
+    "ar": "مسودة سياسة غير معتمدة. المحتوى توضيحي للمناقشة ولا يمثل شروطاً قانونية نهائية.",
+    "en": "Unapproved policy draft. This content supports discussion and does not represent final legal terms."
+  },
+  "p2.privacyTitle": {
+    "ar": "البيانات في هذا النموذج",
+    "en": "Data in this prototype"
+  },
+  "p2.privacyBody": {
+    "ar": "كل السجلات اصطناعية. التغييرات مؤقتة وتُحذف عند إعادة تحميل الصفحة. تُحفظ تفضيلات اللغة والمظهر والدور فقط. سياسة حفظ بيانات الطلبة والموافقات والإفصاح في المنتج النهائي لم تُعتمد بعد.",
+    "en": "All records are synthetic. Changes are temporary and reset on reload. Only language, theme and role preferences persist. Production retention, learner consent and disclosure policies remain unapproved."
+  },
+  "p2.termsTitle": {
+    "ar": "استخدام التجربة",
+    "en": "Using the demo"
+  },
+  "p2.termsBody": {
+    "ar": "هذا تصور تفاعلي، وليس خدمة تعليمية فعلية أو عقد شراء. الهوية والتسجيل والدفع محاكاة. شروط الحسابات وحقوق المحتوى وإدارة الوصول تحتاج إلى اعتماد قبل الإطلاق.",
+    "en": "This is an interactive concept, not a live education service or purchase contract. Identity, registration and payment are simulated. Account terms, content rights and access rules require approval before launch."
+  },
+  "p2.refundsTitle": {
+    "ar": "طلب المساعدة بشأن الاسترداد",
+    "en": "Getting refund help"
+  },
+  "p2.refundsBody": {
+    "ar": "لا تُجرى مدفوعات حقيقية هنا. مدة الاسترداد وشروط الأهلية لم تُعتمد. استخدم نموذج المساعدة لمناقشة الطلب؛ إرسال الطلب لا يضمن الاسترداد ولا يغيّر الوصول تلقائياً.",
+    "en": "No real payments occur here. Refund windows and eligibility are undecided. Use the help form to discuss a request; submitting does not guarantee a refund or automatically change access."
+  },
+  "p2.faq": {
+    "ar": "الأسئلة الشائعة",
+    "en": "FAQ"
+  },
+  "p2.contact": {
+    "ar": "التواصل",
+    "en": "Contact"
+  },
+  "p2.helpIntro": {
+    "ar": "إجابات واضحة ومساعدة في الحسابات والدورات.",
+    "en": "Clear answers and help with accounts and courses."
+  },
+  "p2.email": {
+    "ar": "البريد الإلكتروني",
+    "en": "Email"
+  },
+  "p2.password": {
+    "ar": "كلمة مرور تجريبية",
+    "en": "Demo password"
+  },
+  "p2.passwordHint": {
+    "ar": "أدخل أي نص تجريبي؛ لا تستخدم كلمة مرور حقيقية. لا تُحفظ كلمات المرور.",
+    "en": "Use any demo text, never a real password. Passwords are not stored."
+  },
+  "p2.topic": {
+    "ar": "التصنيف",
+    "en": "Topic"
+  },
+  "p2.body": {
+    "ar": "الرسالة",
+    "en": "Message"
+  },
+  "p2.account": {
+    "ar": "الحساب",
+    "en": "Account"
+  },
+  "p2.course": {
+    "ar": "الدورة",
+    "en": "Course"
+  },
+  "p2.payment": {
+    "ar": "الدفع",
+    "en": "Payment"
+  },
+  "p2.other": {
+    "ar": "أخرى",
+    "en": "Other"
+  },
+  "p2.send": {
+    "ar": "إرسال",
+    "en": "Send"
+  },
+  "p2.ticketDone": {
+    "ar": "أُنشئت تذكرة دعم تجريبية لحسابك.",
+    "en": "A demo support ticket was created for your account."
+  },
+  "p2.anonymousDone": {
+    "ar": "تمت محاكاة استلام رسالتك. لم يُنشأ حساب أو تذكرة محفوظة ولم يُرسل بريد.",
+    "en": "Your anonymous message was simulated. No account or stored ticket was created and no email was sent."
+  },
+  "p2.enrolled": {
+    "ar": "تم الالتحاق وتفعيل الوصول المجاني.",
+    "en": "Enrolled with complimentary access."
+  },
+  "p2.authNote": {
+    "ar": "تجربة بهويات ثابتة وبيانات اصطناعية؛ لا مصادقة أو حسابات حقيقية.",
+    "en": "A demo with fixed personas and synthetic data; no real authentication or accounts."
+  },
+  "p2.signIn": {
+    "ar": "دخول تجريبي",
+    "en": "Demo sign in"
+  },
+  "p2.persona": {
+    "ar": "اختر الهوية التجريبية",
+    "en": "Choose a demo persona"
+  },
+  "p2.resetDone": {
+    "ar": "تمت محاكاة طلب الاستعادة. لم يُرسل بريد ولم تُغيّر كلمة مرور.",
+    "en": "Reset request simulated. No email was sent and no password was changed."
+  },
+  "p2.registerDone": {
+    "ar": "اكتمل نموذج التسجيل التجريبي. تابع باستخدام الهوية الثابتة؛ لم يُنشأ حساب حقيقي.",
+    "en": "Demo registration complete. Continue with the fixed persona; no real account was created."
+  },
+  "p2.continue": {
+    "ar": "متابعة بالهوية التجريبية",
+    "en": "Continue with demo persona"
+  },
+  "p2.linkChild": {
+    "ar": "ربط طالب",
+    "en": "Link a child"
+  },
+  "p2.name": {
+    "ar": "الاسم",
+    "en": "Name"
+  },
+  "p2.choose": {
+    "ar": "اختر",
+    "en": "Choose"
+  },
+  "p2.consent": {
+    "ar": "أوافق على تجربة البيانات الاصطناعية وشروط الاستخدام التوضيحية.",
+    "en": "I agree to the synthetic-data demo and illustrative terms."
+  },
+  "p2.register": {
+    "ar": "تسجيل تجريبي",
+    "en": "Demo registration"
+  },
+  "p2.identity": {
+    "ar": "الهوية",
+    "en": "Identity"
+  },
+  "p2.qualifications": {
+    "ar": "الصفوف والمواد",
+    "en": "Qualifications"
+  },
+  "p2.credentials": {
+    "ar": "المستندات",
+    "en": "Credentials"
+  },
+  "p2.review": {
+    "ar": "المراجعة",
+    "en": "Review"
+  },
+  "p2.phone": {
+    "ar": "الهاتف (اختياري)",
+    "en": "Phone (optional)"
+  },
+  "p2.bio": {
+    "ar": "نبذة تعليمية",
+    "en": "Teaching bio"
+  },
+  "p2.applicationPending": {
+    "ar": "هذا طلب المعلم التجريبي T-004. تقديم الطلب لا يمنح اعتماداً أو حق نشر الدورات.",
+    "en": "This is demo applicant T-004. Submitting does not grant approval or permission to publish courses."
+  },
+  "p2.visitorApplication": {
+    "ar": "لتعديل الطلب، اختر دور الزائر من إعدادات التجربة.",
+    "en": "Choose the visitor role in demo controls to edit this application."
+  },
+  "p2.applicationLocked": {
+    "ar": "الطلب غير قابل للتعديل في حالته الحالية. راجع ملاحظات المراجع.",
+    "en": "This application cannot be edited in its current state. Review the moderator feedback."
+  },
+  "p2.pairHint": {
+    "ar": "اختر أكثر من صف ومادة حسب مؤهلاتك (حتى 12 اختياراً).",
+    "en": "Select the grade-subject pairs you are qualified to teach (up to 12)."
+  },
+  "p2.fileHint": {
+    "ar": "أسماء ملفات فقط؛ لا تُرفع أو تُقرأ ملفات من جهازك.",
+    "en": "Filenames only; no files are uploaded or read from your device."
+  },
+  "p2.filenameHint": {
+    "ar": "مثال: teaching-license.pdf",
+    "en": "Example: teaching-license.pdf"
+  },
+  "p2.credential": {
+    "ar": "مستند",
+    "en": "Credential"
+  },
+  "p2.label0": {
+    "ar": "اسم المؤهل",
+    "en": "Qualification label"
+  },
+  "p2.label1": {
+    "ar": "اسم مؤهل إضافي (اختياري)",
+    "en": "Additional qualification label (optional)"
+  },
+  "p2.file0": {
+    "ar": "اسم ملف المؤهل",
+    "en": "Credential filename"
+  },
+  "p2.file1": {
+    "ar": "اسم ملف إضافي (اختياري)",
+    "en": "Additional filename (optional)"
+  },
+  "p2.application": {
+    "ar": "طلب التدريس",
+    "en": "Teacher application"
+  },
+  "p2.submitApplication": {
+    "ar": "تقديم / تحديث الطلب",
+    "en": "Submit / update application"
+  },
+  "p2.next": {
+    "ar": "حفظ ومتابعة",
+    "en": "Save and continue"
+  },
+  "p2.applicationDone": {
+    "ar": "تم تقديم طلبك للمراجعة.",
+    "en": "Your application was submitted for review."
+  },
+  "error.form": {
+    "ar": "راجع الحقول المحددة.",
+    "en": "Review the highlighted fields."
+  },
+  "error.required": {
+    "ar": "هذا الحقل مطلوب.",
+    "en": "This field is required."
+  },
+  "error.tooShort": {
+    "ar": "أدخل نصاً أطول.",
+    "en": "Enter a longer value."
+  },
+  "error.email": {
+    "ar": "أدخل بريداً إلكترونياً صالح الشكل.",
+    "en": "Enter an email-shaped address."
+  },
+  "error.phone": {
+    "ar": "تحقق من رقم الهاتف.",
+    "en": "Check the phone number."
+  },
+  "error.bioShort": {
+    "ar": "اكتب نبذة من 20 حرفاً على الأقل.",
+    "en": "Write a bio of at least 20 characters."
+  },
+  "error.pairs": {
+    "ar": "اختر صفاً ومادة على الأقل.",
+    "en": "Select at least one grade-subject pair."
+  },
+  "error.pairsInvalid": {
+    "ar": "اختر حتى 12 زوجاً صالحاً من الصفوف والمواد.",
+    "en": "Choose up to 12 valid grade-subject pairs."
+  },
+  "error.filename": {
+    "ar": "استخدم اسم ملف PDF أو PNG أو JPG.",
+    "en": "Use a PDF, PNG or JPG filename."
+  },
+  "error.applicantVisitor": {
+    "ar": "اختر دور الزائر لتعديل الطلب.",
+    "en": "Choose visitor to edit the application."
+  },
+  "error.applicationLocked": {
+    "ar": "لا يمكن تعديل الطلب في حالته الحالية.",
+    "en": "This application is not editable in its current state."
+  },
+  "error.persona": {
+    "ar": "اختر طالباً أو ولي أمر.",
+    "en": "Choose student or guardian."
+  },
+  "error.grade": {
+    "ar": "اختر صفاً صالحاً.",
+    "en": "Choose a valid grade."
+  },
+  "error.consent": {
+    "ar": "الموافقة مطلوبة للمتابعة.",
+    "en": "Consent is required to continue."
+  },
+  "error.contact": {
+    "ar": "أدخل بريداً أو هاتفاً صالحاً.",
+    "en": "Enter a valid email or phone."
+  },
+  "error.applicationIncomplete": {
+    "ar": "أكمل خطوات الطلب قبل التقديم.",
+    "en": "Complete the application steps before submitting."
+  },
+  "error.topic": {
+    "ar": "اختر تصنيفاً صالحاً.",
+    "en": "Choose a valid topic."
+  },
+  "error.messageShort": {
+    "ar": "اكتب رسالة من 10 أحرف على الأقل.",
+    "en": "Write a message of at least 10 characters."
+  },
+  "error.course": {
+    "ar": "اختر دورة منشورة.",
+    "en": "Choose a published course."
+  },
+  "error.enrollStudentOnly": {
+    "ar": "الالتحاق المجاني يتطلب هوية الطالب.",
+    "en": "Free enrollment requires the student persona."
+  },
+  "error.courseUnavailable": {
+    "ar": "الدورة غير متاحة.",
+    "en": "The course is unavailable."
+  },
+  "error.enrollNotFree": {
+    "ar": "هذه الدورة تتطلب الشراء.",
+    "en": "This course requires purchase."
+  },
+  "error.enrollmentSuspended": {
+    "ar": "الالتحاق موقوف. تواصل مع الدعم.",
+    "en": "Enrollment is suspended. Contact support."
+  }
+});
+
 export function esc(value) { return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 export function L(value) { if (value == null) return ''; if (typeof value !== 'object') return String(value); const lang=getState().preferences.lang; return value[lang] ?? value.en ?? value.ar ?? ''; }
 export function t(key, params={}) { return L(dictionary[key] ?? dictionary.unknown).replace(/\{(\w+)\}/g, (_, k) => String(params[k] ?? `{${k}}`)); }
