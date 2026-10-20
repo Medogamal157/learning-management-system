@@ -1355,10 +1355,10 @@ const audits=()=>getState().audit_events;
 const identityOf=id=>{const c=getState().courses.find(x=>x.id===id);return Object.fromEntries(['title','summary','description'].flatMap(k=>[[k+'_ar',c[k].ar],[k+'_en',c[k].en]]));};
 const P8_ROUTES=routes.filter(r=>r.module==='admin'&&!r.path.startsWith('/admin/finance'));
 const O_ONLY=['/admin/people/employees','/admin/academics/curricula','/admin/academics/grades','/admin/academics/subjects','/admin/academics/periods','/admin/academics/translations','/admin/cms/home','/admin/cms/pages','/admin/cms/promotions','/admin/notifications','/admin/reports','/admin/settings/roles','/admin/settings/security','/admin/settings/integrations','/admin/settings/policies'];
-check('P8a routes: 27 views wired, finance stays placeholder, role arrays scoped',()=>{
+check('P8a routes: 27 views wired, finance wired separately (P8b), role arrays scoped',()=>{
  assert.equal(P8_ROUTES.length,27);
  for(const r of P8_ROUTES){assert.ok(!r.view.render.toString().includes('coming'),r.path);assert.ok(!r.roles.includes('admin_finance'),r.path);assert.deepEqual(r.roles,O_ONLY.includes(r.path)?['super_admin']:['admin_moderation','super_admin'],r.path);}
- for(const r of routes.filter(r=>r.path.startsWith('/admin/finance')))assert.ok(r.view.render.toString().includes('coming'),r.path);
+ for(const r of routes.filter(r=>r.path.startsWith('/admin/finance')))assert.ok(!r.view.render.toString().includes('coming'),r.path);
 });
 check('P8a scope: admin_finance gets nothing from people/course/support selectors or reducers',()=>{
  p8Reset('admin_finance');const pre=getState();
@@ -1588,5 +1588,198 @@ for(const lang of ['ar','en'])for(const role of ['admin_moderation','super_admin
 dictionary.unknown=unknownEntry;
 resetDemoData();dispatch('preferences.set',{role:'visitor',lang:'ar'});
 console.log(`P8a render smoke: ${p8Renders} renders`);
+
+// ---------------------------------------------------------------- P8b administration — finance
+const FIN_ROUTES=routes.filter(r=>r.path.startsWith('/admin/finance'));
+const finState=()=>getState();
+const batchOf=id=>finState().payout_batches.find(b=>b.id===id);
+const allocOf=id=>finState().earning_allocations.find(a=>a.id===id);
+const journalsBalance=()=>{
+ const m=new Map();for(const e of finState().financial_ledger_entries){const j=m.get(e.journal_id)??[0,0];j[0]+=e.debit_baisa;j[1]+=e.credit_baisa;m.set(e.journal_id,j);assert.ok(Number.isInteger(e.debit_baisa)&&Number.isInteger(e.credit_baisa)&&(e.debit_baisa===0)!==(e.credit_baisa===0),'entry '+e.id);}
+ for(const [id,[d,c]] of m)assert.equal(d,c,'journal '+id);
+};
+const statesReconcile=()=>{
+ const s=finState();
+ for(const x of s.teachers)for(const state of ['pending','available','reserved','in_payout']){const bal=s.financial_ledger_entries.filter(e=>e.teacher_id===x.id&&e.account==='teacher_'+state).reduce((n,e)=>n+e.credit_baisa-e.debit_baisa,0);assert.equal(bal,s.earning_allocations.filter(a=>a.teacher_id===x.id&&a.state===state).reduce((n,a)=>n+a.amount_baisa,0),`${x.id} ${state}`);}
+ const live=s.payout_batches.filter(b=>b.state!=='Rejected').flatMap(b=>b.allocation_ids);assert.equal(new Set(live).size,live.length,'allocation in two batches');
+ const role=s.preferences.role;dispatch('preferences.set',{role:'super_admin'});assert.ok(select('finance.reconciliation').statements.every(r=>r.reconciled),'finance statements reconcile');dispatch('preferences.set',{role});
+};
+const FIN_SELECTORS=['finance.access','finance.dashboard','finance.orders','finance.refunds','finance.commissions','finance.earnings','finance.payouts','finance.reconciliation','finance.tax'];
+check('P8b routes: 9 finance views wired for admin_finance and super_admin only',()=>{
+ assert.equal(FIN_ROUTES.length,9);
+ for(const r of FIN_ROUTES){assert.deepEqual(r.roles,['admin_finance','super_admin'],r.path);assert.equal(typeof r.view.render,'function',r.path);assert.ok(!r.view.render.toString().includes('coming'),r.path);}
+ assert.ok(!routes.some(r=>r.view.render.toString().includes("t('coming'")),'no placeholder view remains');
+});
+check('P8b scope: admin_moderation and portal personas get no finance data, actions or metrics',()=>{
+ for(const role of ['admin_moderation','teacher','student','guardian','assistant','visitor']){
+  p8Reset(role);const pre=getState();
+  for(const name of FIN_SELECTORS)assert.equal(select(name,{}),null,role+' '+name);
+  for(const name of ['finance.trace','finance.allocation','finance.batch','finance.reconLine'])assert.equal(select(name,{id:'PB-002',key:'payment:PAY-001'}).status,'denied',role+' '+name);
+  for(const [type,payload] of [['earning.releaseHold',{allocationId:'EA-003'}],['earning.adjust',{allocationId:'EA-003',amount:'1',reason:'Test reason'}],['commission.save',{ruleId:'CR-001',rate:'30',active:true,reason:'Test reason'}],['payoutAccount.decide',{accountId:'PA-001',decision:'approve',reason:'Test reason'}],['payout.create',{allocationIds:['EA-AVAILABLE']}],['payout.approve',{batchId:'PB-002'}],['payout.release',{batchId:'PB-003'}],['payout.confirm',{batchId:'PB-004'}],['payout.fail',{batchId:'PB-004'}],['refund.request',{orderItemId:'OI-001',reason:'Test reason'}],['refund.simulate',{refundId:'REF-002',outcome:'success'}],['dispute.open',{orderItemId:'OI-001',reason:'Test reason'}],['reconciliation.mark',{key:'payment:PAY-005',note:'Test reason'}],['finance.saveTaxConfig',{section:'tax'}]])assert.equal(dispatch(type,payload).errorKey,'resourceDenied',role+' '+type);
+  assert.equal(getState(),pre,role+' no mutation');
+ }
+ p8Reset('admin_moderation');
+ for(const r of FIN_ROUTES){const {html,ctx}=p6Render(r.path,{id:'PB-002'});assert.equal(html,fallback('resourceDenied',ctx),r.path);assert.ok(!/OMR|ر\.ع\./.test(html),'no money leak '+r.path);}
+ const denied=fallback('roleDenied',{role:'admin_moderation',path:'/admin/finance/orders'},{roles:['admin_finance','super_admin']});assert.ok(denied.includes('shell.retryRole')&&!/OMR|ORD-0/.test(denied));
+ p8Reset('admin_finance');assert.equal(select('admin.students',{}),null);assert.ok(select('finance.dashboard'));
+});
+check('P8b scenario 9: hold release → F prepares EA-AVAILABLE → F self-approval refused → O approves → fail → revalidate → approve → Paid once',()=>{
+ p8Reset('admin_finance');
+ assert.equal(dispatch('earning.releaseHold',{allocationId:'EA-AVAILABLE'}).errorKey,'p8.finNotPending','already available');
+ assert.ok(dispatch('earning.releaseHold',{allocationId:'EA-003'}).ok);assert.equal(allocOf('EA-003').state,'available');
+ assert.equal(dispatch('payout.create',{allocationIds:['EA-002']}).errorKey,'p8.finInOtherBatch');
+ assert.equal(dispatch('payout.create',{allocationIds:[]}).fieldErrors.allocations,'p8.finSelectAllocation');
+ const c=dispatch('payout.create',{allocationIds:['EA-AVAILABLE']});assert.ok(c.ok);const id=c.data.batchId;
+ assert.deepEqual([batchOf(id).state,batchOf(id).prepared_by,batchOf(id).total_baisa,allocOf('EA-AVAILABLE').state],['Draft','U-F001',24000,'reserved']);
+ assert.equal(dispatch('payout.create',{allocationIds:['EA-AVAILABLE']}).errorKey,'p8.finInOtherBatch','no duplicate selection');
+ assert.ok(dispatch('payout.submit',{batchId:id}).ok);assert.equal(batchOf(id).state,'UnderReview');
+ const view=select('finance.batch',{id}).batch;assert.equal(view.can_approve,false);assert.equal(view.preparer_is_actor,true);
+ const html=p6Render('/admin/finance/payouts/:id',{id}).html;assert.ok(html.includes(esc(t('p8.fin.samePreparerReason')))&&/data-op="approve"[^>]*disabled/.test(html),'approve disabled with reason');
+ assert.ok(p6Render('/admin/finance/payouts',{},'tab=approvals').html.includes(esc(t('p8.fin.youPrepared'))),'queue explains same preparer');
+ const pre=getState();
+ assert.equal(dispatch('payout.approve',{batchId:id}).errorKey,'p8.finSamePreparer','forged approve');assert.equal(dispatch('payout.reject',{batchId:id,reason:'Self review'}).errorKey,'p8.finSamePreparer');assert.equal(getState(),pre);
+ dispatch('preferences.set',{role:'teacher'});const paidBefore=select('teacher.earnings').ledger.paid;
+ dispatch('preferences.set',{role:'super_admin'});
+ assert.ok(select('finance.payouts').approvals.some(b=>b.id===id&&b.can_approve));
+ assert.ok(dispatch('payout.approve',{batchId:id}).ok);assert.equal(batchOf(id).approved_by,'U-O001');
+ assert.ok(dispatch('payout.release',{batchId:id}).ok);assert.deepEqual([batchOf(id).state,allocOf('EA-AVAILABLE').state],['Processing','in_payout']);
+ assert.ok(dispatch('payout.release',{batchId:id}).data.existing,'release repeat is a no-op');assert.equal(batchOf(id).transfer_attempt_ids.length,1);
+ assert.ok(dispatch('payout.fail',{batchId:id}).ok);assert.deepEqual([batchOf(id).state,allocOf('EA-AVAILABLE').state],['Failed','reserved']);
+ assert.ok(finState().financial_ledger_entries.some(e=>e.journal_id.startsWith('J-REVERSE-EA-AVAILABLE')&&e.reversal_of),'reversal journal');
+ dispatch('preferences.set',{role:'teacher'});let te=select('teacher.earnings');assert.equal(te.ledger.paid,paidBefore,'teacher not paid');assert.equal(te.payouts.find(p=>p.batch_id===id).batch.state,'Failed');
+ dispatch('preferences.set',{role:'super_admin'});
+ assert.equal(dispatch('payout.confirm',{batchId:id}).errorKey,'p8.finInvalidTransition','failed batch cannot be confirmed');
+ assert.ok(dispatch('payout.revalidate',{batchId:id}).ok);assert.deepEqual([batchOf(id).state,batchOf(id).approved_by,batchOf(id).allocation_ids],['UnderReview',null,['EA-AVAILABLE']]);
+ assert.ok(dispatch('payout.approve',{batchId:id}).ok);assert.ok(dispatch('payout.release',{batchId:id}).ok);assert.equal(batchOf(id).transfer_attempt_ids.length,2);
+ assert.ok(dispatch('payout.confirm',{batchId:id}).ok);assert.deepEqual([batchOf(id).state,allocOf('EA-AVAILABLE').state],['Paid','paid']);
+ const journals=()=>new Set(finState().financial_ledger_entries.filter(e=>e.journal_id.startsWith('J-PAID-EA-AVAILABLE')).map(e=>e.journal_id)).size;assert.equal(journals(),1);
+ const counts=[finState().teacher_payouts.length,finState().financial_ledger_entries.length,finState().notifications.length];
+ assert.ok(dispatch('payout.confirm',{batchId:id}).data.existing);assert.deepEqual([finState().teacher_payouts.length,finState().financial_ledger_entries.length,finState().notifications.length],counts,'second confirm creates nothing');
+ dispatch('preferences.set',{role:'teacher'});te=select('teacher.earnings');const tp=te.payouts.find(p=>p.batch_id===id);
+ assert.deepEqual([tp.batch.state,tp.amount_baisa,tp.provider_ref],['Paid',24000,batchOf(id).transfer_attempt_ids[1]]);assert.equal(te.ledger.paid,paidBefore+24000);
+ assert.ok(select('notifications').some(n=>n.type==='payout_paid'&&n.href.includes(tp.id)),'teacher notified');
+ assert.ok(p6Render('/teacher/earnings',{},'tab=payouts&record='+tp.id).html.includes(esc(tp.provider_ref)));
+ const actions=finState().audit_events.filter(e=>e.resource_id===id).map(e=>e.action);for(const a of ['payout_batch.create','payout_batch.submit','payout_batch.approve','payout_batch.release','payout_batch.fail','payout_batch.revalidate','payout_batch.confirm'])assert.ok(actions.includes(a),a);
+ // O prepares another batch: O cannot self-approve; F can, as an independent approver.
+ dispatch('preferences.set',{role:'super_admin'});const o=dispatch('payout.create',{allocationIds:['EA-003']});assert.ok(o.ok);assert.ok(dispatch('payout.submit',{batchId:o.data.batchId}).ok);
+ assert.equal(select('finance.batch',{id:o.data.batchId}).batch.can_approve,false);assert.equal(dispatch('payout.approve',{batchId:o.data.batchId}).errorKey,'p8.finSamePreparer');
+ dispatch('preferences.set',{role:'admin_finance'});assert.ok(dispatch('payout.approve',{batchId:o.data.batchId}).ok);assert.equal(batchOf(o.data.batchId).approved_by,'U-F001');
+ journalsBalance();statesReconcile();
+});
+check('P8b scenario 10: item refund isolates sibling, adjusts linked allocation; commission change affects future only; refund after paid recovers',()=>{
+ p8Reset('admin_finance');const seedOI1=structuredClone(finState().order_items.find(i=>i.id==='OI-001').commission_snapshot);
+ assert.equal(dispatch('refund.request',{orderItemId:'OI-003',reason:''}).fieldErrors.reason,'p8.reasonRequired');
+ const req=dispatch('refund.request',{orderItemId:'OI-003',reason:'Bought for the wrong child'});assert.ok(req.ok);const rid=req.data.refundId;
+ assert.equal(dispatch('refund.request',{orderItemId:'OI-003',reason:'Duplicate request'}).fieldErrors.orderItemId,'p8.finRefundExists');
+ assert.equal(dispatch('refund.simulate',{refundId:rid,outcome:'success'}).errorKey,'p8.finInvalidTransition','must be approved first');
+ assert.ok(dispatch('refund.decide',{refundId:rid,decision:'approve'}).ok);
+ assert.ok(dispatch('refund.simulate',{refundId:rid,outcome:'failure'}).ok);assert.equal(finState().access_grants.find(g=>g.id==='AG-002').status,'active','failure changes nothing');
+ const r=dispatch('refund.simulate',{refundId:rid,outcome:'success'});assert.ok(r.ok);assert.deepEqual(r.data.revoked,['AG-002']);
+ const g=id=>finState().access_grants.find(x=>x.id===id);assert.deepEqual([g('AG-002').status,g('AG-004').status],['revoked','active'],'only the refunded item grant');
+ const order=finState().orders.find(o=>o.id==='ORD-002');assert.equal(order.state,'partially_refunded');assert.equal(order.total_baisa,60000,'order amount unchanged');
+ assert.deepEqual([allocOf('EA-002').state,batchOf('PB-003').state],['reserved','Approved'],'sibling allocation untouched');
+ const adj=finState().adjustments.find(a=>a.id===r.data.adjustmentId);assert.deepEqual([adj.original_allocation_id,adj.refund_id,adj.signed_amount_baisa],['EA-003',rid,-20000]);
+ assert.equal(allocOf('EA-003').state,'adjusted');assert.ok(finState().financial_ledger_entries.some(e=>e.journal_id===adj.journal_id));
+ assert.equal(dispatch('refund.simulate',{refundId:rid,outcome:'failure'}).errorKey,'p8.finRefundSettled','stale failure cannot overwrite');assert.ok(dispatch('refund.simulate',{refundId:rid,outcome:'success'}).data.existing);
+ dispatch('preferences.set',{role:'student'});assert.equal(can('read_content',course('C-010')),false);
+ dispatch('preferences.set',{role:'teacher'});const ta=select('teacher.earnings').adjustments.find(x=>x.id===adj.id);assert.ok(ta);assert.deepEqual([ta.item.id,ta.original.snapshot.rate_bps,ta.original.snapshot.teacher_baisa],['OI-003',2000,20000]);
+ // Commission default change: existing snapshot stays 20%, a later purchase snapshots the new version.
+ dispatch('preferences.set',{role:'admin_finance'});
+ assert.equal(dispatch('commission.save',{ruleId:'CR-001',rate:'25',active:true,reason:''}).fieldErrors.reason,'p8.reasonRequired');
+ assert.equal(dispatch('commission.save',{ruleId:'CR-001',rate:'20',active:true,reason:'No change'}).fieldErrors.rate,'p8.finNoChange');
+ assert.equal(dispatch('commission.save',{ruleId:'CR-001',rate:'25',active:false,reason:'Turn off default'}).fieldErrors.active,'p8.finDefaultRequired');
+ const cr=dispatch('commission.save',{ruleId:'CR-001',rate:'25',active:true,reason:'Illustrative rate review'});assert.ok(cr.ok);assert.equal(cr.data.version,2);
+ assert.equal(dispatch('commission.save',{ruleId:'CR-001',rate:'30',active:true,reason:'Edit old version'}).errorKey,'p8.finRuleSuperseded');
+ assert.deepEqual(finState().order_items.find(i=>i.id==='OI-001').commission_snapshot,seedOI1);assert.equal(seedOI1.rate_bps,2000);
+ assert.ok(finState().audit_events.some(e=>e.action==='commission_rule.version'&&e.reason==='Illustrative rate review'));
+ dispatch('preferences.set',{role:'student'});const o=dispatch('checkout.createOrder',{courseId:'C-001',consent:true});assert.ok(o.ok);assert.ok(sendPayment(o.data.orderId,'success').ok);
+ const snap=finState().order_items.find(i=>i.order_id===o.data.orderId).commission_snapshot;assert.deepEqual([snap.rule_id,snap.version,snap.rate_bps,snap.platform_baisa,snap.teacher_baisa],[cr.data.ruleId,2,2500,7500,22500]);
+ // Refund after paid: seed fixture plus a fresh one on PB-004 once it is paid; Paid history stays Paid.
+ dispatch('preferences.set',{role:'admin_finance'});
+ assert.deepEqual([batchOf('PB-005').state,allocOf('EA-006').state,allocOf('EA-008').amount_baisa,allocOf('EA-008').original_allocation_id],['Paid','paid',-36000,'EA-006']);
+ assert.ok(dispatch('refund.decide',{refundId:'REF-002',decision:'approve'}).ok);
+ assert.equal(dispatch('refund.simulate',{refundId:'REF-002',outcome:'success'}).errorKey,'p8.finAllocationLocked','in payout');
+ assert.ok(dispatch('payout.confirm',{batchId:'PB-004'}).ok);assert.equal(allocOf('EA-004').state,'paid');
+ dispatch('preferences.set',{role:'super_admin'});const recBefore=select('finance.reconciliation').statements.find(x=>x.id==='T-002').ledger.recoverable;
+ dispatch('preferences.set',{role:'admin_finance'});const rr=dispatch('refund.simulate',{refundId:'REF-002',outcome:'success'});assert.ok(rr.ok);
+ assert.deepEqual([batchOf('PB-004').state,allocOf('EA-004').state],['Paid','paid'],'paid history preserved');
+ const rec=finState().earning_allocations.find(a=>a.original_allocation_id==='EA-004');assert.deepEqual([rec.state,rec.amount_baisa],['adjusted',-25500]);
+ const j=finState().adjustments.find(a=>a.id===rr.data.adjustmentId).journal_id;assert.ok(finState().financial_ledger_entries.some(e=>e.journal_id===j&&e.account==='teacher_recovery'&&e.debit_baisa===25500));
+ assert.equal(select('finance.reconciliation').statements.find(x=>x.id==='T-002').ledger.recoverable,recBefore+25500);
+ assert.equal(finState().orders.find(x=>x.id==='ORD-003').state,'refunded');
+ const lines=select('finance.reconciliation').lines;assert.ok(lines.filter(l=>l.kind==='refund').every(l=>l.status==='matched'),'refund lines reconcile');
+ journalsBalance();statesReconcile();
+});
+check('P8b disputes, account verification, item removal and rejection keep journals and approvals consistent',()=>{
+ p8Reset('admin_finance');
+ const d=dispatch('dispute.open',{orderItemId:'OI-003',reason:'Provider chargeback notice'});assert.ok(d.ok);assert.deepEqual(d.data.held,['EA-003']);assert.equal(allocOf('EA-003').state,'reserved');
+ assert.equal(dispatch('payout.create',{allocationIds:['EA-003']}).errorKey,'p8.finNotAvailable','held allocation not selectable');
+ assert.ok(dispatch('dispute.decide',{disputeId:d.data.disputeId,decision:'review'}).ok);
+ assert.ok(dispatch('dispute.decide',{disputeId:d.data.disputeId,decision:'won',reason:'Evidence accepted'}).ok);assert.equal(allocOf('EA-003').state,'pending','restored to prior state');
+ const d2=dispatch('dispute.open',{orderItemId:'OI-001',reason:'Second chargeback'});assert.ok(dispatch('dispute.decide',{disputeId:d2.data.disputeId,decision:'lost',reason:'Provider ruled for buyer'}).ok);
+ assert.equal(allocOf('EA-AVAILABLE').state,'adjusted');assert.ok(finState().adjustments.some(a=>a.dispute_id===d2.data.disputeId));
+ // Payout account change verified after approval invalidates it; removing an item also invalidates.
+ dispatch('preferences.set',{role:'teacher'});assert.ok(dispatch('payoutAccount.requestChange',{beneficiaryName:'Ahmed Al Harthi',accountRef:'4321',consent:true}).ok);
+ dispatch('preferences.set',{role:'admin_finance'});assert.ok(dispatch('earning.releaseHold',{allocationId:'EA-003'}).ok);
+ const b=dispatch('payout.create',{allocationIds:['EA-003']}).data.batchId;assert.ok(dispatch('payout.submit',{batchId:b}).ok);
+ dispatch('preferences.set',{role:'super_admin'});assert.ok(dispatch('payout.approve',{batchId:b}).ok);
+ dispatch('preferences.set',{role:'admin_finance'});assert.ok(dispatch('payoutAccount.decide',{accountId:'PA-001',decision:'approve',reason:'Synthetic evidence matched'}).ok);
+ assert.deepEqual([batchOf(b).state,batchOf(b).approved_by,batchOf(b).destination_snapshots[0].masked_iban],['UnderReview',null,'OM•• •••• •••• DEMO 4321']);
+ assert.ok(finState().audit_events.some(e=>e.action==='payout_batch.approval_invalidated'&&e.resource_id===b));
+ assert.equal(dispatch('payout.release',{batchId:b}).errorKey,'p8.finInvalidTransition');
+ assert.ok(dispatch('payout.removeItem',{batchId:'PB-003',allocationId:'EA-002',reason:'Hold for review'}).ok);assert.deepEqual([batchOf('PB-003').state,allocOf('EA-002').state],['Draft','available']);
+ assert.ok(dispatch('payout.updateDraft',{batchId:'PB-001',allocationIds:['EA-002']}).ok);assert.equal(batchOf('PB-001').total_baisa,28000);assert.ok(dispatch('payout.submit',{batchId:'PB-001'}).ok);
+ dispatch('preferences.set',{role:'super_admin'});assert.ok(dispatch('payout.reject',{batchId:'PB-001',reason:'Wrong period'}).ok);
+ assert.deepEqual([batchOf('PB-001').state,batchOf('PB-001').allocation_ids,allocOf('EA-002').state],['Rejected',[],'available']);
+ dispatch('preferences.set',{role:'admin_finance'});assert.ok(dispatch('payout.reopen',{batchId:'PB-001'}).ok);assert.equal(batchOf('PB-001').state,'Draft');
+ // Permission removal (roles editor) blocks the specific finance action.
+ dispatch('preferences.set',{role:'super_admin'});assert.ok(dispatch('roles.save',{assignmentId:'RA-005',permissions:['finance.prepare_payout'],reason:'Narrow scope'}).ok);
+ dispatch('preferences.set',{role:'admin_finance'});assert.equal(dispatch('payout.approve',{batchId:'PB-002'}).errorKey,'p8.finPermission');assert.equal(select('finance.batch',{id:'PB-002'}).batch.can_approve,false);
+ journalsBalance();statesReconcile();
+});
+check('P8b reconciliation, manual adjustment, CSV and tax demo config',()=>{
+ p8Reset('admin_finance');const rec=select('finance.reconciliation');
+ assert.ok(rec.lines.some(l=>l.key==='payment:PAY-005'&&l.status==='exception'&&l.reason==='awaiting_provider'));assert.ok(rec.lines.some(l=>l.key==='payout:TP-004'&&l.status==='exception'));
+ assert.equal(rec.journals.balanced,rec.journals.count);
+ assert.equal(dispatch('reconciliation.mark',{key:'payment:PAY-001',note:'Already fine'}).errorKey,'p8.finAlreadyMatched');
+ assert.equal(dispatch('reconciliation.mark',{key:'payment:PAY-005',note:''}).fieldErrors.note,'p8.reasonRequired');
+ assert.ok(dispatch('reconciliation.mark',{key:'payment:PAY-005',reason:'Provider statement line 42 shows pending'}).ok);
+ assert.equal(select('finance.reconciliation').lines.find(l=>l.key==='payment:PAY-005').status,'matched_manual');
+ const csv=adminViews.financeCsv('recon',select('finance.reconciliation'));assert.ok(csv.startsWith('﻿')&&csv.includes('PAY-005')&&!/undefined|NaN|\[object/.test(csv));
+ for(const k of ['statements','ledger']){const c=adminViews.financeCsv(k,k==='ledger'?select('finance.earnings',{}):select('finance.reconciliation'));assert.ok(c.split('\r\n').length>3&&!/undefined|NaN|\[object/.test(c),k);}
+ assert.equal(dispatch('earning.adjust',{allocationId:'EA-003',amount:'abc',reason:'Bonus'}).fieldErrors.amount,'p8.finAmountInvalid');
+ assert.ok(dispatch('earning.adjust',{allocationId:'EA-003',amount:'2.500',reason:'Illustrative bonus'}).ok);assert.ok(dispatch('earning.adjust',{allocationId:'EA-003',amount:'-1.000',reason:'Illustrative correction'}).ok);
+ assert.equal(allocOf('EA-003').state,'pending','original allocation untouched');
+ assert.equal(dispatch('finance.saveTaxConfig',{section:'tax',tax_label_ar:'ضريبة',tax_label_en:'Tax',rate:'500'}).fieldErrors.rate,'p8.finRateInvalid');
+ assert.ok(dispatch('finance.saveTaxConfig',{section:'tax',tax_label_ar:'ضريبة توضيحية',tax_label_en:'Illustrative tax',rate:'5',registration:'DEMO-123',inclusive:'on'}).ok);
+ assert.ok(dispatch('finance.saveTaxConfig',{section:'invoices',prefix:'demo',next_number:'7',issuer_ar:'جهة تجريبية',issuer_en:'Demo issuer',footer_ar:'فاتورة تجريبية',footer_en:'Demo invoice'}).ok);
+ const st=finState().platform_settings[0];assert.deepEqual([st.tax_config.status,st.tax_config.rate_bps,st.invoice_config.status,st.invoice_config.prefix],['unconfirmed',500,'demo','DEMO']);
+ dispatch('preferences.set',{role:'student'});const o=dispatch('checkout.createOrder',{courseId:'C-001',consent:true});assert.equal(finState().orders.find(x=>x.id===o.data.orderId).tax_baisa,0,'demo tax never applied');
+ journalsBalance();statesReconcile();
+});
+let p8bRenders=0;dictionary.unknown={ar:'MISSING_DICTIONARY_KEY',en:'MISSING_DICTIONARY_KEY'};
+const FIN_CASES=[['/admin/finance'],['/admin/finance/orders',{},'record=ORD-002'],['/admin/finance/orders',{},'tab=transactions&record=PAY-007'],['/admin/finance/orders',{},'q=ORD-00&state=paid'],['/admin/finance/orders',{},'record=ORD-999'],
+ ['/admin/finance/refunds',{},'record=REF-001'],['/admin/finance/refunds',{},'record=REF-002'],['/admin/finance/refunds',{},'tab=disputes&record=DIS-001'],['/admin/finance/commissions',{},'record=CR-001'],['/admin/finance/commissions',{},'record=new'],
+ ['/admin/finance/earnings',{},'record=EA-003'],['/admin/finance/earnings',{},'record=EA-008'],['/admin/finance/earnings',{},'teacher=T-003'],['/admin/finance/earnings',{},'tab=ledger&kind=SALE'],['/admin/finance/reconciliation',{},'record=payment%3APAY-005'],['/admin/finance/reconciliation',{},'record=payout%3ATP-005'],
+ ...['PB-001','PB-002','PB-003','PB-004','PB-005','PB-006'].map(id=>['/admin/finance/payouts/:id',{id}]),['/admin/finance/payouts/:id',{id:'PB-999'}]];
+for(const r of FIN_ROUTES)for(const tab of r.queryValues.tab??[])FIN_CASES.push([r.path,{},'tab='+tab]);
+for(const lang of ['ar','en'])for(const role of ['admin_finance','super_admin']){
+ const run=(list,tag='')=>{for(const [path,params={},query=''] of list)check(`P8b render ${role}/${lang}${tag} ${path} ${params.id??''} ${query}`,()=>{const before=getState(),{html,ctx}=p6Render(path,params,query);p8bRenders++;assert.equal(getState(),before,'render is read-only');p8Clean(html);
+  if(params.id==='PB-999'){assert.equal(html,fallback('missing',ctx));return;}
+  const rec=new URLSearchParams(query).get('record');if(rec)assert.ok(html.includes('id="record-drawer"'),'record drawer');});};
+ p8Reset(role);dispatch('preferences.set',{lang});run(FIN_CASES);
+ // Mutated states: Rejected batch, failed/succeeded refunds, dispute decisions, invalid forms, manual match and tax preview.
+ dispatch('payout.updateDraft',{batchId:'PB-001',allocationIds:['EA-AVAILABLE']});dispatch('payout.submit',{batchId:'PB-001'});
+ dispatch('preferences.set',{role:role==='super_admin'?'admin_finance':'super_admin'});dispatch('payout.reject',{batchId:'PB-001',reason:'Render smoke'});dispatch('payout.approve',{batchId:'PB-002'});dispatch('preferences.set',{role});
+ dispatch('payout.fail',{batchId:'PB-004'});dispatch('earning.releaseHold',{allocationId:'EA-003'});dispatch('refund.request',{orderItemId:'OI-003',reason:'Render smoke'});
+ const rid=getState().refunds.at(-1).id;dispatch('refund.decide',{refundId:rid,decision:'approve'});dispatch('refund.simulate',{refundId:rid,outcome:'success'});
+ dispatch('dispute.open',{orderItemId:'OI-001',reason:'<img src=x onerror=alert(1)> chargeback'});dispatch('reconciliation.mark',{key:'payment:PAY-005',note:'Render smoke evidence'});
+ dispatch('admin.saveForm',{name:'rule:CR-001',values:{rate:'x'},fieldErrors:{rate:'p8.finRateInvalid'}});dispatch('admin.saveForm',{name:'tax:tax',values:{rate:'7',intent:'preview'}});dispatch('admin.saveForm',{name:'batch-create',values:{},fieldErrors:{allocations:'p8.finSelectAllocation'}});
+ run([['/admin/finance'],['/admin/finance/payouts/:id',{id:'PB-001'}],['/admin/finance/payouts/:id',{id:'PB-002'}],['/admin/finance/payouts/:id',{id:'PB-004'}],['/admin/finance/payouts',{},'tab=batches'],['/admin/finance/payouts',{},'tab=approvals'],['/admin/finance/refunds',{},'record='+rid],['/admin/finance/refunds',{},'tab=disputes'],['/admin/finance/refunds',{},'tab=chargebacks'],['/admin/finance/commissions',{},'record=CR-001'],['/admin/finance/reconciliation',{},'record=payment%3APAY-005'],['/admin/finance/tax'],['/admin/finance/earnings',{},'tab=ledger']],' mutated');
+ check(`P8b render ${role}/${lang} escapes staff-entered dispute reason`,()=>{const {html}=p6Render('/admin/finance/refunds',{},'tab=disputes&record='+getState().disputes.at(-1).id);assert.ok(html.includes('&lt;img src=x onerror=alert(1)&gt;')&&!html.includes('<img src=x'));});
+}
+dictionary.unknown=unknownEntry;
+resetDemoData();dispatch('preferences.set',{role:'visitor',lang:'ar'});
+console.log(`P8b render smoke: ${p8bRenders} renders`);
 
 console.log(`${passed} checks passed${process.exitCode ? ' (with failures above)' : ''}`);

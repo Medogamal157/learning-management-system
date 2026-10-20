@@ -1821,7 +1821,7 @@ function saveRecord(s,actor,{collection,prefix,type,id,values,summary,extra={}})
 }
 Object.assign(reducers,{
  'admin.saveForm':(s,p,{can})=>{
-  if(!ADMIN_MODULES.some(m=>staffCan(can,m))||typeof p.name!=='string'||!/^[\w:-]{1,60}$/.test(p.name))return fail('invalidAction');
+  if(![...ADMIN_MODULES,'finance'].some(m=>staffCan(can,m))||typeof p.name!=='string'||!/^[\w:-]{1,60}$/.test(p.name))return fail('invalidAction');
   const values=Object.fromEntries(Object.entries(p.values??{}).filter(([k,v])=>/^\w{1,40}$/.test(k)&&typeof v==='string').map(([k,v])=>[k,v.slice(0,4000)]));
   const fieldErrors=Object.fromEntries(Object.entries(p.fieldErrors??{}).filter(([k,v])=>/^\w{1,40}$/.test(k)&&typeof v==='string'&&/^(?:error|p5|p6|p8)\.\w+$/.test(v)));
   (s.transient.adminForms??={})[p.name]={values,fieldErrors};return ok(null);
@@ -2235,5 +2235,515 @@ Object.assign(reducers,{
   const n=(set.integration_tests?.[p.key]?.run??0)+1;
   (set.integration_tests??={})[p.key]={run:n,at:DEMO_NOW,outcome:'simulated_ok',latency_ms:120+Object.keys(set.integration_statuses).indexOf(p.key)*37+n*3,reference:`SIM-${p.key.toUpperCase()}-${String(n).padStart(3,'0')}`};
   audit(s,actor,'integration.test','integration',p.key,'','simulated_ok');return ok({...set.integration_tests[p.key]});
+ },
+});
+
+// ---- P8b administration — finance. Module scope comes from can() (admin_finance and super_admin only; moderation never),
+// the separate prepare / approve / release / refund / reconcile permissions from the actor's active role assignment, and
+// payout approval additionally requires approver ≠ prepared_by (can('finance.approve_payout'), super_admin included).
+// Money moves only through balanced journals appended here; allocation states mirror the teacher_* ledger accounts and
+// history (sale snapshots, original allocations, Paid batches) is never rewritten — corrections are new linked records.
+export const PAYOUT_FLOW=['Draft','UnderReview','Approved','Processing','Paid'];
+export const FIN_PERMS=Object.freeze({prepare:'finance.prepare_payout',approve:'finance.approve_payout',release:'finance.release_payout',refund:'finance.refund',reconcile:'finance.reconcile'});
+export const JOURNAL_KINDS=['SALE','RELEASE','HOLD','UNHOLD','RESERVE','UNRESERVE','PROCESS','PAID','REVERSE','REFUND','DISPUTE','ADJUST'];
+const PAYABLE_STATES=['pending','available','reserved','in_payout','paid'];
+const LIVE_BATCH=['Draft','UnderReview','Approved','Processing','Paid','Failed'];
+const finOk=can=>can('finance.manage',{module:'finance'});
+const hasPerm=(s,actor,key)=>s.role_assignments.some(r=>r.user_id===actor.user_id&&r.status==='active'&&r.permissions.includes(key));
+function finGate(s,actor,can,perm=null) { if(!finOk(can))return 'resourceDenied';return perm&&!hasPerm(s,actor,FIN_PERMS[perm])?'p8.finPermission':null; }
+const jid=(s,kind,id)=>{ const base=`J-${kind}-${id}`,used=new Set(s.financial_ledger_entries.map(e=>e.journal_id));if(!used.has(base))return base;let n=2;while(used.has(`${base}-${n}`))n++;return `${base}-${n}`; };
+function post(s,kind,id,[sourceType,sourceId],teacherId,lines,reversalOf=null) {
+ const journal=jid(s,kind,id);
+ for(const [account,debit,credit] of lines)if(debit||credit)s.financial_ledger_entries.push({id:nextId(s.financial_ledger_entries,'LE'),journal_id:journal,account,teacher_id:teacherId,source_type:sourceType,source_id:sourceId,debit_baisa:debit,credit_baisa:credit,currency:'OMR',created_at:DEMO_NOW,reversal_of:reversalOf});
+ return journal;
+}
+// One balanced journal per payable-state transfer, e.g. available → reserved.
+function shift(s,a,to,kind,source=['earning_allocation',a.id],reversalOf=null) {
+ const journal=post(s,kind,a.id,source,a.teacher_id,[[`teacher_${a.state}`,a.amount_baisa,0],[`teacher_${to}`,0,a.amount_baisa]],reversalOf);
+ Object.assign(a,{state:to,updated_at:DEMO_NOW});return journal;
+}
+const batchOfAllocation=(s,id)=>s.payout_batches.find(b=>LIVE_BATCH.includes(b.state)&&b.allocation_ids.includes(id))??null;
+const accountOf=(s,teacherId)=>s.teacher_payout_accounts.find(a=>a.teacher_id===teacherId)??null;
+const destinationOf=acc=>({payout_account_id:acc.id,teacher_id:acc.teacher_id,beneficiary_name:structuredClone(acc.beneficiary_name),masked_iban:acc.masked_iban,verification_state:acc.verification_state});
+const saleAllocation=(s,itemId)=>s.earning_allocations.find(a=>a.order_item_id===itemId&&!a.original_allocation_id)??null;
+const payoutFor=(s,b,a)=>s.teacher_payouts.find(p=>p.batch_id===b.id&&p.teacher_id===a.teacher_id);
+// Rebuilds per-teacher payouts, total and destination snapshots from the batch's allocation selection.
+function syncBatch(s,b) {
+ const rows=b.allocation_ids.map(id=>s.earning_allocations.find(a=>a.id===id)),teachers=[...new Set(rows.map(a=>a.teacher_id))];
+ b.total_baisa=rows.reduce((n,a)=>n+a.amount_baisa,0);b.destination_snapshots=teachers.map(tid=>destinationOf(accountOf(s,tid)));b.updated_at=DEMO_NOW;
+ s.teacher_payouts=s.teacher_payouts.filter(p=>p.batch_id!==b.id||teachers.includes(p.teacher_id));
+ for(const tid of teachers){
+  const mine=rows.filter(a=>a.teacher_id===tid);let p=s.teacher_payouts.find(x=>x.batch_id===b.id&&x.teacher_id===tid);
+  if(!p){p={id:nextId(s.teacher_payouts,'TP'),batch_id:b.id,teacher_id:tid,payout_account_id:accountOf(s,tid).id,provider_ref:null,reconciled_at:null,created_at:DEMO_NOW};s.teacher_payouts.push(p);}
+  Object.assign(p,{allocation_ids:mine.map(a=>a.id),amount_baisa:mine.reduce((n,a)=>n+a.amount_baisa,0),state:b.state,updated_at:DEMO_NOW});
+ }
+}
+const setBatch=(s,b,state,extra={})=>{ Object.assign(b,{state,...extra,updated_at:DEMO_NOW});for(const p of s.teacher_payouts.filter(x=>x.batch_id===b.id))Object.assign(p,{state,updated_at:DEMO_NOW}); };
+// Re-checks a submitted batch against the live records: amount, reserved selection and verified destinations.
+function batchProblem(s,b) {
+ if(!b.allocation_ids.length)return 'p8.finSelectAllocation';
+ const rows=b.allocation_ids.map(id=>s.earning_allocations.find(a=>a.id===id));
+ if(rows.some(a=>!a||a.state!=='reserved'))return 'p8.finAllocationState';
+ if(rows.reduce((n,a)=>n+a.amount_baisa,0)!==b.total_baisa)return 'p8.finAmountChanged';
+ const teachers=new Set(rows.map(a=>a.teacher_id));
+ if(b.destination_snapshots.length!==teachers.size||b.destination_snapshots.some(d=>{const acc=s.teacher_payout_accounts.find(a=>a.id===d.payout_account_id);return !acc||!teachers.has(acc.teacher_id)||acc.verification_state!=='verified'||acc.masked_iban!==d.masked_iban;}))return 'p8.finDestinationChanged';
+ return null;
+}
+function invalidateApproval(s,actor,b,why) { const before=b.state;setBatch(s,b,'UnderReview',{approved_by:null,approved_at:null,approval_invalidated:why});audit(s,actor,'payout_batch.approval_invalidated','payout_batch',b.id,before,'UnderReview',why); }
+function selectable(s,ids,batchId=null) {
+ if(!Array.isArray(ids)||ids.some(x=>typeof x!=='string')||new Set(ids).size!==ids.length)return 'invalidAction';
+ for(const id of ids){
+  const a=s.earning_allocations.find(x=>x.id===id);if(!a)return 'missing';
+  const other=batchOfAllocation(s,id);if(other&&other.id!==batchId)return 'p8.finInOtherBatch';
+  if((!other&&a.state!=='available')||a.amount_baisa<=0)return 'p8.finNotAvailable';
+  if(accountOf(s,a.teacher_id)?.verification_state!=='verified')return 'p8.finNoVerifiedAccount';
+ }
+ return null;
+}
+const omrText=baisa=>({ar:`${(baisa/1000).toFixed(3)} ر.ع.`,en:`OMR ${(baisa/1000).toFixed(3)}`});
+const buyerHref=(s,order)=>roleOfUser(s,order.buyer_user_id)==='guardian'?'#/guardian/orders':`#/checkout/order/${order.id}/receipt`;
+const parseSignedOmr=v=>{ const m=/^([+-])?(\d{1,4})(?:\.(\d{1,3}))?$/.exec(String(v??'').trim());return m?(m[1]==='-'?-1:1)*(Number(m[2])*1000+Number((m[3]??'').padEnd(3,'0'))):null; };
+const percentBps=v=>{ const m=/^(\d{1,3})(?:\.(\d{1,2}))?$/.exec(String(v??'').trim());const n=m?Number(m[1])*100+Number((m[2]??'').padEnd(2,'0')):null;return n!==null&&n<=10000?n:null; };
+// Reverses one item's teacher share. Before payout the payable itself is reversed (allocation → adjusted); after payout
+// the Paid allocation and its batch stay untouched and a linked negative allocation records the recoverable amount.
+function reverseSale(s,item,{refundId=null,disputeId=null,reason}) {
+ const a=saleAllocation(s,item.id);if(!a)return {error:'p8.finNotRefundable'};
+ const snap=item.commission_snapshot,id=nextId(s.adjustments,'ADJ'),kind=disputeId?'DISPUTE':'REFUND',inBatch=batchOfAllocation(s,a.id);
+ let journal;
+ if(['pending','available'].includes(a.state)||(a.state==='reserved'&&!inBatch)) {
+  journal=post(s,kind,id,['adjustment',id],a.teacher_id,[['platform_commission',snap.platform_baisa,0],[`teacher_${a.state}`,a.amount_baisa,0],['provider_clearing',0,snap.base_baisa]]);
+  Object.assign(a,{state:'adjusted',hold_reason:'',updated_at:DEMO_NOW});
+ } else if(a.state==='paid') {
+  journal=post(s,kind,id,['adjustment',id],a.teacher_id,[['platform_commission',snap.platform_baisa,0],['teacher_recovery',a.amount_baisa,0],['provider_clearing',0,snap.base_baisa]]);
+  s.earning_allocations.push({id:nextId(s.earning_allocations,'EA'),order_item_id:item.id,teacher_id:a.teacher_id,snapshot:structuredClone(a.snapshot),amount_baisa:-a.amount_baisa,state:'adjusted',original_allocation_id:a.id,hold_reason:'recovery_after_payout',eligible_at:DEMO_NOW,created_at:DEMO_NOW,updated_at:DEMO_NOW});
+ } else return {error:'p8.finAllocationLocked'};
+ const adjustment={id,original_allocation_id:a.id,refund_id:refundId,dispute_id:disputeId,signed_amount_baisa:-a.amount_baisa,reason,journal_id:journal,created_at:DEMO_NOW,updated_at:DEMO_NOW};
+ s.adjustments.push(adjustment);return {adjustment,allocation:a};
+}
+function itemRow(s,i) {
+ const a=saleAllocation(s,i.id),grant=s.access_grants.filter(g=>g.source_id===i.id).at(-1)??null,refund=s.refunds.filter(r=>r.order_item_id===i.id).at(-1)??null;
+ return {...i,beneficiary_name:i.beneficiary_name_snapshot??s.students.find(x=>x.id===i.beneficiary_student_id)?.name??null,teacher_name:s.teachers.find(x=>x.id===i.owner_teacher_id_snapshot)?.name??null,
+  allocation:a?{id:a.id,state:a.state,amount_baisa:a.amount_baisa}:null,grant:grant?{id:grant.id,status:grant.status,origin:grant.origin}:null,refund:refund?{id:refund.id,state:refund.state}:null,
+  dispute:s.disputes.filter(d=>d.order_item_id===i.id).at(-1)??null};
+}
+function txRow(s,x) {
+ const events=s.provider_events.filter(e=>e.payment_transaction_id===x.id);
+ return {...x,events,mismatch:events.some(e=>e.payload.amount_baisa!==x.amount_baisa||e.payload.currency!==x.currency||e.payload.order_id!==x.order_id),attempts:s.payment_transactions.filter(y=>y.order_id===x.order_id).length};
+}
+function orderRow(s,o) {
+ const items=s.order_items.filter(i=>i.order_id===o.id).map(i=>itemRow(s,i)),txs=s.payment_transactions.filter(x=>x.order_id===o.id).map(x=>txRow(s,x));
+ return {...o,buyer:userName(s,o.buyer_user_id),buyer_role:roleOfUser(s,o.buyer_user_id),items,transactions:txs,mismatch:txs.some(x=>x.mismatch)||items.reduce((n,i)=>n+i.total_baisa,0)!==o.total_baisa,commission:items.reduce((n,i)=>n+i.commission_snapshot.platform_baisa,0)};
+}
+function sourceHref(s,e) {
+ if(e.source_type==='order_item'){const i=s.order_items.find(x=>x.id===e.source_id);return i?'#/admin/finance/orders?record='+i.order_id:null;}
+ if(e.source_type==='earning_allocation')return '#/admin/finance/earnings?record='+e.source_id;
+ if(e.source_type==='teacher_payout'){const p=s.teacher_payouts.find(x=>x.id===e.source_id);return p?'#/admin/finance/payouts/'+p.batch_id:null;}
+ if(e.source_type==='dispute')return '#/admin/finance/refunds?tab=disputes&record='+e.source_id;
+ if(e.source_type==='adjustment'){const x=s.adjustments.find(v=>v.id===e.source_id);return x?.refund_id?'#/admin/finance/refunds?record='+x.refund_id:x?.dispute_id?'#/admin/finance/refunds?tab=disputes&record='+x.dispute_id:'#/admin/finance/refunds?tab=chargebacks';}
+ return null;
+}
+function journalList(s) {
+ const map=new Map();for(const e of s.financial_ledger_entries){if(!map.has(e.journal_id))map.set(e.journal_id,[]);map.get(e.journal_id).push(e);}
+ return [...map].map(([id,lines])=>{const debit=lines.reduce((n,e)=>n+e.debit_baisa,0),credit=lines.reduce((n,e)=>n+e.credit_baisa,0),first=lines[0];return {id,kind:id.split('-')[1],lines,debit,credit,balanced:debit===credit,created_at:first.created_at,source_type:first.source_type,source_id:first.source_id,teacher_id:first.teacher_id,teacher:s.teachers.find(x=>x.id===first.teacher_id)?.name??null,href:sourceHref(s,first),reversal:lines.some(e=>e.reversal_of)};}).sort((a,b)=>b.created_at.localeCompare(a.created_at)||b.id.localeCompare(a.id));
+}
+// Teacher statement: balances per payable state from ledger accounts beside the allocation totals they must equal;
+// recoverable amounts reconcile with the adjustments whose journals debit teacher_recovery.
+function statements(s) {
+ return s.teachers.map(x=>{
+  const ledger=teacherLedger(s,x.id),alloc=Object.fromEntries(EARNING_STATES.map(k=>[k,s.earning_allocations.filter(a=>a.teacher_id===x.id&&a.state===k).reduce((n,a)=>n+a.amount_baisa,0)]));
+  const recovery=s.adjustments.filter(j=>s.earning_allocations.find(a=>a.id===j.original_allocation_id)?.teacher_id===x.id).reduce((n,j)=>n+s.financial_ledger_entries.filter(e=>e.journal_id===j.journal_id&&e.account==='teacher_recovery').reduce((m,e)=>m+e.debit_baisa-e.credit_baisa,0),0);
+  return {id:x.id,name:x.name,ledger,alloc,recovery,reconciled:['pending','available','reserved','in_payout','paid'].every(k=>ledger[k]===alloc[k])&&ledger.recoverable===recovery,account:accountOf(s,x.id)};
+ }).filter(r=>r.ledger.entries>0);
+}
+function reconLines(s) {
+ const lines=[];
+ const clearing=(pred,side)=>s.financial_ledger_entries.filter(e=>e.account==='provider_clearing'&&pred(e)).reduce((n,e)=>n+e[side],0);
+ const line=(kind,id,reference,provider,internal,reason,record)=>{const auto=provider!==null&&provider===internal&&!reason,m=record.reconciliation??null;lines.push({key:`${kind}:${id}`,kind,id,reference,provider_baisa:provider,internal_baisa:internal,diff:provider===null?null:provider-internal,status:auto?'matched':m?'matched_manual':'exception',reason:auto?null:reason??'amount_mismatch',mark:m});};
+ for(const x of s.payment_transactions){
+  const items=new Set(s.order_items.filter(i=>i.order_id===x.order_id).map(i=>i.id)),settled=['succeeded','refunded','partially_refunded'].includes(x.state),waiting=['pending','initiated'].includes(x.state);
+  const captured=s.provider_events.some(e=>e.payment_transaction_id===x.id&&['success','succeeded'].includes(e.payload.outcome));
+  line('payment',x.id,x.provider_ref,waiting?null:captured?x.amount_baisa:0,settled?clearing(e=>e.source_type==='order_item'&&items.has(e.source_id),'debit_baisa'):0,waiting?'awaiting_provider':null,x);
+ }
+ for(const r of s.refunds.filter(v=>v.state==='succeeded')){const adj=s.adjustments.find(a=>a.id===r.adjustment_id);line('refund',r.id,r.id,r.amount_baisa,adj?clearing(e=>e.journal_id===adj.journal_id,'credit_baisa'):0,null,r);}
+ for(const p of s.teacher_payouts){const b=s.payout_batches.find(x=>x.id===p.batch_id);if(!['Processing','Paid','Failed'].includes(b?.state))continue;line('payout',p.id,p.provider_ref,b.state==='Processing'?null:b.state==='Paid'?p.amount_baisa:0,clearing(e=>e.source_type==='teacher_payout'&&e.source_id===p.id,'credit_baisa'),b.state==='Processing'?'awaiting_confirmation':null,p);}
+ return lines;
+}
+const reconRecord=(s,key)=>{ const [kind,id]=String(key??'').split(':');return kind==='payment'?s.payment_transactions.find(x=>x.id===id):kind==='refund'?s.refunds.find(x=>x.id===id):kind==='payout'?s.teacher_payouts.find(x=>x.id===id):null; };
+const permsOf=(s,actor)=>Object.fromEntries(Object.entries(FIN_PERMS).map(([k,v])=>[k,hasPerm(s,actor,v)]));
+function batchView(s,b,can,actor) {
+ const items=b.allocation_ids.map(id=>{const a=s.earning_allocations.find(x=>x.id===id),i=s.order_items.find(x=>x.id===a?.order_item_id);return {id,state:a?.state??null,amount_baisa:a?.amount_baisa??0,teacher_id:a?.teacher_id??null,teacher:s.teachers.find(x=>x.id===a?.teacher_id)?.name??null,item_id:i?.id??null,title:i?.title_snapshot??null};});
+ const events=s.audit_events.filter(e=>e.resource_type==='payout_batch'&&e.resource_id===b.id).sort((x,y)=>x.created_at.localeCompare(y.created_at)||x.id.localeCompare(y.id)).map(auditRow(s));
+ const independent=can('finance.approve_payout',b);
+ return {...b,preparer:userName(s,b.prepared_by),approver:userName(s,b.approved_by),items,events,
+  payouts:s.teacher_payouts.filter(p=>p.batch_id===b.id).map(p=>({...p,teacher:s.teachers.find(x=>x.id===p.teacher_id)?.name??null})),
+  destinations:b.destination_snapshots.map(d=>{const acc=s.teacher_payout_accounts.find(a=>a.id===d.payout_account_id);return {...d,teacher:s.teachers.find(x=>x.id===d.teacher_id)?.name??null,current:acc?{masked_iban:acc.masked_iban,verification_state:acc.verification_state}:null,matches:!!acc&&acc.masked_iban===d.masked_iban&&acc.verification_state==='verified'};}),
+  preparer_is_actor:b.prepared_by===actor.user_id,independent,can_approve:independent&&hasPerm(s,actor,FIN_PERMS.approve),problem:['UnderReview','Approved'].includes(b.state)?batchProblem(s,b):null,perms:permsOf(s,actor)};
+}
+const availableAllocations=s=>s.earning_allocations.filter(a=>a.state==='available'&&a.amount_baisa>0&&!batchOfAllocation(s,a.id)).map(a=>{const i=s.order_items.find(x=>x.id===a.order_item_id);return {...a,title:i?.title_snapshot??null,teacher:s.teachers.find(x=>x.id===a.teacher_id)?.name??null,verified:accountOf(s,a.teacher_id)?.verification_state==='verified'};});
+const activeDispute=(s,itemId)=>s.disputes.some(d=>d.order_item_id===itemId&&['open','under_review'].includes(d.state));
+registerSelectors({
+ 'finance.access':(s,_a,{can,actor})=>finOk(can)?{actor,perms:permsOf(s,actor)}:null,
+ 'finance.dashboard':(s,_a,{can,actor})=>{
+  if(!finOk(can))return null;
+  const st=statements(s),sum=(k,src='ledger')=>st.reduce((n,r)=>n+r[src][k],0),lines=reconLines(s),js=journalList(s),open=s.refunds.filter(r=>['requested','under_review','approved','failed'].includes(r.state));
+  const batches=state=>s.payout_batches.filter(b=>b.state===state).map(b=>({id:b.id,state:b.state,total_baisa:b.total_baisa,period_label:b.period_label,own:b.prepared_by===actor.user_id,can_approve:can('finance.approve_payout',b)}));
+  return {summary:financeSummary(s),payables:PAYABLE_STATES.map(k=>({state:k,ledger:sum(k),allocations:sum(k,'alloc')})),recoverable:sum('recoverable'),
+   refunds:{succeeded:s.refunds.filter(r=>r.state==='succeeded').reduce((n,r)=>n+r.amount_baisa,0),count:s.refunds.filter(r=>r.state==='succeeded').length,open:open.length},
+   exceptions:lines.filter(l=>l.status==='exception'),journals:js.length,unbalanced:js.filter(j=>!j.balanced).length,reconciled:st.every(r=>r.reconciled),
+   due:{UnderReview:batches('UnderReview'),Approved:batches('Approved'),Processing:batches('Processing'),Failed:batches('Failed'),Draft:batches('Draft'),
+    holds:s.earning_allocations.filter(a=>a.state==='pending').length,available:availableAllocations(s).length,accounts:s.teacher_payout_accounts.filter(a=>a.change_request?.state==='pending_verification').length,refunds:open.length,disputes:s.disputes.filter(d=>['open','under_review'].includes(d.state)).length}};
+ },
+ 'finance.orders':(s,{q='',state=''},{can})=>{
+  if(!finOk(can))return null;const needle=String(q??'').trim().toLowerCase(),has=v=>String(v??'').toLowerCase().includes(needle);
+  const rows=[...s.orders].sort(byNewest).map(o=>orderRow(s,o));
+  return {rows:rows.filter(o=>(!needle||[o.id,L2(o.buyer),...o.items.flatMap(i=>[i.id,L2(i.beneficiary_name),L2(i.title_snapshot)]),...o.transactions.map(x=>x.provider_ref)].some(has))&&(!state||o.state===state)),
+   transactions:rows.flatMap(o=>o.transactions.map(x=>({...x,order_state:o.state,buyer:o.buyer}))).filter(x=>(!needle||[x.id,x.order_id,x.provider_ref].some(has))&&(!state||x.state===state)).sort(byNewest),total:rows.length};
+ },
+ 'finance.trace':(s,{id},{can})=>{
+  if(!finOk(can))return {status:'denied'};
+  const tx=s.payment_transactions.find(x=>x.id===id),o=s.orders.find(x=>x.id===(tx?.order_id??id));if(!o)return {status:'missing'};
+  const row=orderRow(s,o),items=new Set(row.items.map(i=>i.id)),allocs=new Set(s.earning_allocations.filter(a=>items.has(a.order_item_id)).map(a=>a.id)),adj=new Set(s.adjustments.filter(a=>allocs.has(a.original_allocation_id)).map(a=>a.id));
+  return {status:'ok',order:row,focus:tx?.id??null,refunds:s.refunds.filter(r=>r.order_id===o.id),adjustments:s.adjustments.filter(a=>adj.has(a.id)),grants:s.access_grants.filter(g=>items.has(g.source_id)),
+   journals:journalList(s).filter(j=>(j.source_type==='order_item'&&items.has(j.source_id))||(j.source_type==='adjustment'&&adj.has(j.source_id))||(j.source_type==='earning_allocation'&&allocs.has(j.source_id)))};
+ },
+ 'finance.refunds':(s,_a,{can,actor})=>{
+  if(!finOk(can))return null;
+  const item=id=>{const i=s.order_items.find(x=>x.id===id);return i?itemRow(s,i):null;};
+  const refunds=[...s.refunds].sort(byNewest).map(r=>({...r,item:item(r.order_item_id),requester:userName(s,r.requested_by),approver:userName(s,r.approved_by),adjustment:s.adjustments.find(a=>a.id===r.adjustment_id)??null,
+   siblings:s.order_items.filter(i=>i.order_id===r.order_id&&i.id!==r.order_item_id).map(i=>itemRow(s,i)),order_state:s.orders.find(o=>o.id===r.order_id)?.state??null,history:auditFor(s,e=>e.resource_type==='refund'&&e.resource_id===r.id)}));
+  const disputes=[...s.disputes].sort(byNewest).map(d=>({...d,item:item(d.order_item_id),held:d.held_allocation_ids.map(id=>s.earning_allocations.find(a=>a.id===id)).filter(Boolean),adjustment:s.adjustments.find(a=>a.dispute_id===d.id)??null,history:auditFor(s,e=>e.resource_type==='dispute'&&e.resource_id===d.id)}));
+  const eligible=s.order_items.filter(i=>['paid','partially_refunded'].includes(s.orders.find(o=>o.id===i.order_id)?.state)&&saleAllocation(s,i.id)).map(i=>itemRow(s,i));
+  return {refunds,disputes,adjustments:[...s.adjustments].sort(byNewest).map(a=>({...a,teacher:s.teachers.find(x=>x.id===s.earning_allocations.find(e=>e.id===a.original_allocation_id)?.teacher_id)?.name??null})),
+   refundable:eligible.filter(i=>!s.refunds.some(r=>r.order_item_id===i.id&&r.state!=='rejected')),disputable:eligible.filter(i=>!activeDispute(s,i.id)&&!s.refunds.some(r=>r.order_item_id===i.id&&r.state==='succeeded')),perms:permsOf(s,actor)};
+ },
+ 'finance.commissions':(s,_a,{can})=>{
+  if(!finOk(can))return null;
+  const decorate=r=>({...r,teacher:s.teachers.find(x=>x.id===r.teacher_id)?.name??null,course_title:r.course_id?courseName(s,r.course_id):null,author:userName(s,r.created_by),effective:r.active&&r.active_from<=DEMO_NOW&&(!r.active_until||r.active_until>DEMO_NOW),snapshots:s.order_items.filter(i=>i.commission_snapshot.rule_id===r.id).length});
+  const order={campaign:0,teacher:1,default:2};
+  return {current:s.commission_rules.filter(r=>!r.superseded_by).map(decorate).sort((a,b)=>order[a.scope]-order[b.scope]||a.id.localeCompare(b.id)),history:s.commission_rules.filter(r=>r.superseded_by).map(decorate).sort(byNewest),
+   snapshots:[...s.order_items].sort(byNewest).slice(0,8).map(i=>({id:i.id,order_id:i.order_id,title:i.title_snapshot,teacher:s.teachers.find(x=>x.id===i.owner_teacher_id_snapshot)?.name??null,created_at:i.created_at,snapshot:i.commission_snapshot})),
+   teachers:s.teachers.filter(x=>x.application_status==='approved'&&!s.commission_rules.some(r=>r.scope==='teacher'&&r.teacher_id===x.id&&!r.superseded_by)).map(x=>({id:x.id,name:x.name})),
+   audit:auditFor(s,e=>e.resource_type==='commission_rule')};
+ },
+ 'finance.earnings':(s,{teacher='',kind=''},{can,actor})=>{
+  if(!finOk(can))return null;
+  const st=statements(s),teacherId=st.some(r=>r.id===teacher)?teacher:'',all=journalList(s);
+  const allocations=s.earning_allocations.filter(a=>!teacherId||a.teacher_id===teacherId).map(a=>{const i=s.order_items.find(x=>x.id===a.order_item_id);return {...a,title:i?.title_snapshot??null,teacher:s.teachers.find(x=>x.id===a.teacher_id)?.name??null,batch_id:batchOfAllocation(s,a.id)?.id??null,dispute_id:s.disputes.find(d=>d.held_allocation_ids.includes(a.id)&&['open','under_review'].includes(d.state))?.id??null};}).sort((a,b)=>a.teacher_id.localeCompare(b.teacher_id)||a.id.localeCompare(b.id));
+  return {statements:st,teacher:teacherId,kind:JOURNAL_KINDS.includes(kind)?kind:'',allocations,journals:all.filter(j=>(!teacherId||j.teacher_id===teacherId)&&(!kind||j.kind===kind)),total:all.length,unbalanced:all.filter(j=>!j.balanced).length,perms:permsOf(s,actor),
+   history:auditFor(s,e=>['earning_allocation','adjustment'].includes(e.resource_type))};
+ },
+ 'finance.allocation':(s,{id},{can})=>{
+  if(!finOk(can))return {status:'denied'};const a=s.earning_allocations.find(x=>x.id===id);if(!a)return {status:'missing'};
+  const i=s.order_items.find(x=>x.id===a.order_item_id),linked=s.earning_allocations.filter(x=>x.original_allocation_id===a.id),ids=new Set([a.id,...linked.map(x=>x.id)]),adjustments=s.adjustments.filter(x=>x.original_allocation_id===a.id);
+  return {status:'ok',allocation:{...a,teacher:s.teachers.find(x=>x.id===a.teacher_id)?.name??null,batch_id:batchOfAllocation(s,a.id)?.id??null},item:i?itemRow(s,i):null,linked,adjustments,
+   journals:journalList(s).filter(j=>ids.has(j.source_id)||(j.source_type==='order_item'&&j.source_id===a.order_item_id&&!a.original_allocation_id)||adjustments.some(x=>x.journal_id===j.id)||j.lines.some(e=>e.source_type==='teacher_payout'&&s.teacher_payouts.some(p=>p.id===e.source_id&&p.allocation_ids.includes(a.id)))),
+   history:auditFor(s,e=>(e.resource_type==='earning_allocation'&&e.resource_id===a.id)||(e.resource_type==='adjustment'&&adjustments.some(x=>x.id===e.resource_id)))};
+ },
+ 'finance.payouts':(s,_a,{can,actor})=>{
+  if(!finOk(can))return null;
+  const batches=[...s.payout_batches].sort(byNewest).map(b=>batchView(s,b,can,actor));
+  return {accounts:s.teacher_payout_accounts.map(a=>({...a,teacher:s.teachers.find(x=>x.id===a.teacher_id)?.name??null,verifier:userName(s,a.verified_by),batches:s.payout_batches.filter(b=>['Draft','UnderReview','Approved'].includes(b.state)&&b.destination_snapshots.some(d=>d.payout_account_id===a.id)).map(b=>b.id),history:auditFor(s,e=>e.resource_type==='teacher_payout_account'&&e.resource_id===a.id)})),
+   batches,approvals:batches.filter(b=>b.state==='UnderReview'),available:availableAllocations(s),perms:permsOf(s,actor)};
+ },
+ 'finance.batch':(s,{id},{can,actor})=>{
+  if(!finOk(can))return {status:'denied'};const b=s.payout_batches.find(x=>x.id===id);if(!b)return {status:'missing'};
+  const view=batchView(s,b,can,actor),payouts=new Set(s.teacher_payouts.filter(p=>p.batch_id===b.id).map(p=>p.id)),allocs=new Set([...b.allocation_ids,...(b.released_allocation_ids??[])]);
+  return {status:'ok',batch:view,available:b.state==='Draft'?availableAllocations(s):[],journals:journalList(s).filter(j=>(j.source_type==='teacher_payout'&&payouts.has(j.source_id))||(['RESERVE','UNRESERVE'].includes(j.kind)&&allocs.has(j.source_id)&&j.created_at>=b.created_at))};
+ },
+ 'finance.reconciliation':(s,_a,{can,actor})=>{
+  if(!finOk(can))return null;
+  const lines=reconLines(s),total=(k,f=()=>true)=>lines.filter(f).reduce((n,l)=>n+(l[k]??0),0),js=journalList(s);
+  return {lines,kinds:['payment','refund','payout'].map(kind=>({kind,provider:total('provider_baisa',l=>l.kind===kind),internal:total('internal_baisa',l=>l.kind===kind),exceptions:lines.filter(l=>l.kind===kind&&l.status==='exception').length,count:lines.filter(l=>l.kind===kind).length})),
+   provider:total('provider_baisa'),internal:total('internal_baisa'),exceptions:lines.filter(l=>l.status==='exception').length,
+   journals:{count:js.length,balanced:js.filter(j=>j.balanced).length,debit:js.reduce((n,j)=>n+j.debit,0),credit:js.reduce((n,j)=>n+j.credit,0),byKind:JOURNAL_KINDS.map(k=>({kind:k,count:js.filter(j=>j.kind===k).length})).filter(k=>k.count)},
+   statements:statements(s),summary:financeSummary(s),perms:permsOf(s,actor),history:auditFor(s,e=>e.action==='reconciliation.mark')};
+ },
+ 'finance.reconLine':(s,{key},{can})=>{
+  if(!finOk(can))return {status:'denied'};const l=reconLines(s).find(x=>x.key===key);if(!l)return {status:'missing'};
+  const record=reconRecord(s,key),orderId=l.kind==='payout'?null:record.order_id,adjustment=l.kind==='refund'?s.adjustments.find(a=>a.id===record.adjustment_id):null;
+  const journals=journalList(s).filter(j=>l.kind==='payment'?j.kind==='SALE'&&s.order_items.some(i=>i.order_id===orderId&&i.id===j.source_id):l.kind==='refund'?j.id===adjustment?.journal_id:j.source_type==='teacher_payout'&&j.source_id===record.id);
+  return {status:'ok',line:l,events:l.kind==='payment'?s.provider_events.filter(e=>e.payment_transaction_id===record.id):[],journals,order_id:orderId,batch_id:l.kind==='payout'?record.batch_id:null,marker:userName(s,l.mark?.by)};
+ },
+ 'finance.tax':(s,_a,{can})=>{
+  if(!finOk(can))return null;const set=s.platform_settings[0],sample=s.order_items.find(i=>i.id==='OI-001');
+  return {tax:set.tax_config,invoice:set.invoice_config,sample:sample?{...sample,order:s.orders.find(o=>o.id===sample.order_id)}:null,history:auditFor(s,e=>e.resource_type==='platform_settings')};
+ },
+});
+Object.assign(reducers,{
+ // Explicit demo hold release (pending → available); no clock-driven release in the prototype.
+ 'earning.releaseHold':(s,p,{actor,can})=>{
+  const g=finGate(s,actor,can,'reconcile');if(g)return fail(g);
+  const a=s.earning_allocations.find(x=>x.id===p.allocationId);if(!a)return fail('missing');
+  if(a.state!=='pending')return fail('p8.finNotPending');
+  const journal=shift(s,a,'available','RELEASE');a.hold_reason='';audit(s,actor,'earning.release_hold','earning_allocation',a.id,'pending','available',journal);
+  return ok({allocationId:a.id,journal});
+ },
+ // Reasoned manual adjustment linked to an original sale allocation: a credit becomes a new available allocation,
+ // a debit a recoverable amount; the original allocation is never edited.
+ 'earning.adjust':(s,p,{actor,can})=>{
+  const g=finGate(s,actor,can,'reconcile');if(g)return fail(g);
+  const a=s.earning_allocations.find(x=>x.id===p.allocationId&&!x.original_allocation_id);if(!a)return fail('missing');
+  const amount=parseSignedOmr(p.amount),r=reasonOf(p.reason);
+  const errors=pick({amount:amount===null||amount===0||Math.abs(amount)>1000000?'p8.finAmountInvalid':null,reason:r.error});if(Object.keys(errors).length)return failFields(errors);
+  const id=nextId(s.adjustments,'ADJ'),abs=Math.abs(amount);
+  const journal=post(s,'ADJUST',id,['adjustment',id],a.teacher_id,amount>0?[['platform_commission',abs,0],['teacher_available',0,abs]]:[['teacher_recovery',abs,0],['platform_commission',0,abs]]);
+  const linked={id:nextId(s.earning_allocations,'EA'),order_item_id:a.order_item_id,teacher_id:a.teacher_id,snapshot:structuredClone(a.snapshot),amount_baisa:amount,state:amount>0?'available':'adjusted',original_allocation_id:a.id,hold_reason:'manual_adjustment',eligible_at:DEMO_NOW,created_at:DEMO_NOW,updated_at:DEMO_NOW};
+  s.earning_allocations.push(linked);
+  s.adjustments.push({id,original_allocation_id:a.id,refund_id:null,dispute_id:null,signed_amount_baisa:amount,reason:typed(r.value),journal_id:journal,created_at:DEMO_NOW,updated_at:DEMO_NOW});
+  audit(s,actor,'adjustment.create','adjustment',id,a.id,String(amount),r.value);
+  notifyUser(s,s.teachers.find(x=>x.id===a.teacher_id)?.user_id,{event:'adjustment-'+id,type:'earning_adjusted',title:{ar:'تعديل على مستحقاتك',en:'An adjustment was added to your earnings'},body:typed(r.value),href:'#/teacher/earnings?tab=sales',courseId:null});
+  return ok({adjustmentId:id,allocationId:linked.id,journal});
+ },
+ // Commission rules are versioned: an edit supersedes the current row and appends a new version. Order item
+ // snapshots keep the rule/version/rate they were created with, so only future orders see the change.
+ 'commission.save':(s,p,{actor,can})=>{
+  const g=finGate(s,actor,can);if(g)return fail(g);
+  const old=p.ruleId?s.commission_rules.find(r=>r.id===p.ruleId):null;if(p.ruleId&&!old)return fail('missing');
+  if(old?.superseded_by)return fail('p8.finRuleSuperseded');
+  const bps=percentBps(p.rate),on=p.active===true||p.active==='on'||p.active==='true',r=reasonOf(p.reason);
+  const teacher=old?null:s.teachers.find(x=>x.id===p.teacherId&&x.application_status==='approved');
+  const errors=pick({rate:bps===null?'p8.finRateInvalid':old&&old.rate_bps===bps&&old.active===on?'p8.finNoChange':null,reason:r.error,
+   teacherId:old?null:!teacher?'error.required':s.commission_rules.some(x=>x.scope==='teacher'&&x.teacher_id===teacher.id&&!x.superseded_by)?'p8.finOverrideExists':null,
+   active:old?.scope==='default'&&!on?'p8.finDefaultRequired':null});
+  if(Object.keys(errors).length)return failFields(errors);
+  const row={id:nextId(s.commission_rules,'CR'),scope:old?.scope??'teacher',teacher_id:old?old.teacher_id:teacher.id,course_id:old?.course_id??null,version:(old?.version??0)+1,rate_bps:bps,
+   active_from:on?DEMO_NOW:old?.active_from??DEMO_NOW,active:on,label:old?structuredClone(old.label):{ar:'استثناء توضيحي للمعلم',en:'Illustrative teacher override'},family_id:old?.family_id??old?.id??null,previous_rule_id:old?.id??null,reason:r.value,created_by:actor.user_id,created_at:DEMO_NOW,updated_at:DEMO_NOW};
+  row.family_id??=row.id;
+  if(old)Object.assign(old,{active:false,active_until:DEMO_NOW,superseded_by:row.id,updated_at:DEMO_NOW});
+  s.commission_rules.push(row);
+  audit(s,actor,old?'commission_rule.version':'commission_rule.create','commission_rule',row.id,old?`${old.id} v${old.version} · ${old.rate_bps}bps${old.active?'':' off'}`:'',`${row.id} v${row.version} · ${bps}bps${on?'':' off'}`,r.value);
+  return ok({ruleId:row.id,version:row.version});
+ },
+ // Destination changes requested by teachers (P6) become effective only after finance verification. A verified change
+ // refreshes open batch snapshots and invalidates any approval that relied on the old destination.
+ 'payoutAccount.decide':(s,p,{actor,can})=>{
+  const g=finGate(s,actor,can);if(g)return fail(g);
+  const acc=s.teacher_payout_accounts.find(a=>a.id===p.accountId);if(!acc)return fail('missing');
+  const cr=acc.change_request;if(cr?.state!=='pending_verification')return fail('p8.finNoChangeRequest');
+  if(!['approve','reject'].includes(p.decision))return fail('invalidAction');
+  const r=reasonOf(p.reason);if(r.error)return failFields({reason:r.error});
+  const before=acc.masked_iban;(acc.change_history??=[]).push({...structuredClone(cr),state:p.decision==='approve'?'verified':'rejected',decided_by:actor.user_id,decided_at:DEMO_NOW});
+  if(p.decision==='approve'){
+   Object.assign(acc,{masked_iban:cr.masked_iban,beneficiary_name:structuredClone(cr.beneficiary_name),verification_state:'verified',verified_by:actor.user_id,changed_at:DEMO_NOW});
+   for(const b of s.payout_batches.filter(x=>['Draft','UnderReview','Approved'].includes(x.state)&&x.destination_snapshots.some(d=>d.payout_account_id===acc.id))){const was=b.state;b.destination_snapshots=b.destination_snapshots.map(d=>d.payout_account_id===acc.id?destinationOf(acc):d);if(was==='Approved')invalidateApproval(s,actor,b,'p8.finDestinationChanged');}
+  }
+  acc.change_request=null;acc.updated_at=DEMO_NOW;
+  audit(s,actor,p.decision==='approve'?'payout_account.verify_change':'payout_account.reject_change','teacher_payout_account',acc.id,before,acc.masked_iban,r.value);
+  notifyUser(s,s.teachers.find(x=>x.id===acc.teacher_id)?.user_id,{event:`payout-account-${p.decision}-${acc.id}-${acc.change_history.length}`,type:'payout_account',title:p.decision==='approve'?{ar:'تم توثيق حساب الصرف الجديد',en:'New payout destination verified'}:{ar:'لم يُعتمد تغيير حساب الصرف',en:'Payout destination change declined'},body:typed(r.value),href:'#/teacher/earnings?tab=destination',courseId:null});
+  return ok({accountId:acc.id});
+ },
+ 'payout.create':(s,p,{actor,can})=>{
+  const g=finGate(s,actor,can,'prepare');if(g)return fail(g);
+  const ids=Array.isArray(p.allocationIds)?p.allocationIds:[];if(!ids.length)return failFields({allocations:'p8.finSelectAllocation'},'p8.finSelectAllocation');
+  const e=selectable(s,ids);if(e)return fail(e);
+  const b={id:nextId(s.payout_batches,'PB'),state:'Draft',prepared_by:actor.user_id,approved_by:null,period_label:{ar:'أكتوبر ٢٠٢٦',en:'October 2026'},allocation_ids:[...ids],total_baisa:0,destination_snapshots:[],submitted_at:null,approved_at:null,failure_reason:'',transfer_attempt_ids:[],created_at:DEMO_NOW,updated_at:DEMO_NOW};
+  s.payout_batches.push(b);
+  for(const id of ids)shift(s,s.earning_allocations.find(a=>a.id===id),'reserved','RESERVE');
+  syncBatch(s,b);audit(s,actor,'payout_batch.create','payout_batch',b.id,'','Draft',ids.join(', '));
+  return ok({batchId:b.id});
+ },
+ 'payout.updateDraft':(s,p,{actor,can})=>{
+  const g=finGate(s,actor,can,'prepare');if(g)return fail(g);
+  const b=s.payout_batches.find(x=>x.id===p.batchId);if(!b)return fail('missing');if(b.state!=='Draft')return fail('p8.finInvalidTransition');
+  const ids=Array.isArray(p.allocationIds)?p.allocationIds:[],e=selectable(s,ids,b.id);if(e)return fail(e);
+  const removed=b.allocation_ids.filter(x=>!ids.includes(x)),added=ids.filter(x=>!b.allocation_ids.includes(x));
+  if(!removed.length&&!added.length)return ok({batchId:b.id,existing:true});
+  const before=b.total_baisa;
+  for(const id of removed)shift(s,s.earning_allocations.find(a=>a.id===id),'available','UNRESERVE');
+  for(const id of added)shift(s,s.earning_allocations.find(a=>a.id===id),'reserved','RESERVE');
+  b.allocation_ids=[...ids];syncBatch(s,b);audit(s,actor,'payout_batch.update','payout_batch',b.id,String(before),String(b.total_baisa),ids.join(', '));
+  return ok({batchId:b.id});
+ },
+ // Submit locks the selection and the destination snapshot taken from the currently verified accounts.
+ 'payout.submit':(s,p,{actor,can})=>{
+  const g=finGate(s,actor,can,'prepare');if(g)return fail(g);
+  const b=s.payout_batches.find(x=>x.id===p.batchId);if(!b)return fail('missing');
+  if(b.state==='UnderReview')return ok({batchId:b.id,existing:true});if(b.state!=='Draft')return fail('p8.finInvalidTransition');
+  if(!b.allocation_ids.length)return fail('p8.finSelectAllocation');
+  if(b.allocation_ids.some(id=>accountOf(s,s.earning_allocations.find(a=>a.id===id).teacher_id)?.verification_state!=='verified'))return fail('p8.finNoVerifiedAccount');
+  syncBatch(s,b);setBatch(s,b,'UnderReview',{submitted_at:DEMO_NOW,submitted_by:actor.user_id,approval_invalidated:null});
+  audit(s,actor,'payout_batch.submit','payout_batch',b.id,'Draft','UnderReview');
+  for(const x of b.destination_snapshots)notifyUser(s,s.teachers.find(v=>v.id===x.teacher_id)?.user_id,{event:`payout-review-${b.id}-${s.audit_events.length}`,type:'payout_review',title:{ar:'دفعة صرف قيد المراجعة',en:'Payout batch under review'},body:{ar:`الدفعة ${b.id} بانتظار اعتماد مستقل.`,en:`Batch ${b.id} awaits independent approval.`},href:'#/teacher/earnings?tab=payouts',courseId:null});
+  return ok({batchId:b.id});
+ },
+ // Independent approval: the approver must differ from prepared_by (super_admin included) and hold the approve permission.
+ 'payout.approve':(s,p,{actor,can})=>{
+  const g=finGate(s,actor,can,'approve');if(g)return fail(g);
+  const b=s.payout_batches.find(x=>x.id===p.batchId);if(!b)return fail('missing');
+  if(!can('finance.approve_payout',b))return fail('p8.finSamePreparer');
+  if(b.state!=='UnderReview')return fail('p8.finInvalidTransition');
+  const problem=batchProblem(s,b);if(problem)return fail(problem);
+  setBatch(s,b,'Approved',{approved_by:actor.user_id,approved_at:DEMO_NOW,approval_invalidated:null});audit(s,actor,'payout_batch.approve','payout_batch',b.id,'UnderReview','Approved');
+  return ok({batchId:b.id});
+ },
+ // Returned for changes: reservations go back to available with new journals; the batch remembers what it released.
+ 'payout.reject':(s,p,{actor,can})=>{
+  const g=finGate(s,actor,can,'approve');if(g)return fail(g);
+  const b=s.payout_batches.find(x=>x.id===p.batchId);if(!b)return fail('missing');
+  if(!can('finance.approve_payout',b))return fail('p8.finSamePreparer');
+  if(b.state!=='UnderReview')return fail('p8.finInvalidTransition');
+  const r=reasonOf(p.reason);if(r.error)return failFields({reason:r.error});
+  for(const id of b.allocation_ids)shift(s,s.earning_allocations.find(a=>a.id===id),'available','UNRESERVE');
+  b.released_allocation_ids=[...new Set([...(b.released_allocation_ids??[]),...b.allocation_ids])];b.allocation_ids=[];syncBatch(s,b);
+  setBatch(s,b,'Rejected',{rejected_by:actor.user_id,rejected_reason:r.value,approved_by:null,approved_at:null});audit(s,actor,'payout_batch.reject','payout_batch',b.id,'UnderReview','Rejected',r.value);
+  notifyUser(s,b.prepared_by,{event:`payout-rejected-${b.id}-${s.audit_events.length}`,type:'payout_review',title:{ar:'أعيدت دفعة صرف للتعديل',en:'Payout batch returned for changes'},body:typed(r.value),href:'#/admin/finance/payouts/'+b.id,courseId:null});
+  return ok({batchId:b.id});
+ },
+ 'payout.reopen':(s,p,{actor,can})=>{
+  const g=finGate(s,actor,can,'prepare');if(g)return fail(g);
+  const b=s.payout_batches.find(x=>x.id===p.batchId);if(!b)return fail('missing');if(b.state!=='Rejected')return fail('p8.finInvalidTransition');
+  setBatch(s,b,'Draft',{submitted_at:null,approved_by:null,approved_at:null});audit(s,actor,'payout_batch.reopen','payout_batch',b.id,'Rejected','Draft');
+  return ok({batchId:b.id});
+ },
+ // Changing the amount of a submitted batch releases that allocation and invalidates any approval already given.
+ 'payout.removeItem':(s,p,{actor,can})=>{
+  const g=finGate(s,actor,can,'prepare');if(g)return fail(g);
+  const b=s.payout_batches.find(x=>x.id===p.batchId);if(!b)return fail('missing');if(!['UnderReview','Approved'].includes(b.state))return fail('p8.finInvalidTransition');
+  if(!b.allocation_ids.includes(p.allocationId))return fail('missing');
+  const r=reasonOf(p.reason);if(r.error)return failFields({reason:r.error});
+  const was=b.state,before=b.total_baisa;shift(s,s.earning_allocations.find(a=>a.id===p.allocationId),'available','UNRESERVE');
+  b.allocation_ids=b.allocation_ids.filter(x=>x!==p.allocationId);b.released_allocation_ids=[...new Set([...(b.released_allocation_ids??[]),p.allocationId])];syncBatch(s,b);
+  audit(s,actor,'payout_batch.remove_item','payout_batch',b.id,String(before),String(b.total_baisa),r.value);
+  if(!b.allocation_ids.length)setBatch(s,b,'Draft',{submitted_at:null,approved_by:null,approved_at:null});else if(was==='Approved')invalidateApproval(s,actor,b,'p8.finAmountChanged');
+  return ok({batchId:b.id,state:b.state});
+ },
+ // Release revalidates the approved snapshot; a changed amount or destination sends the batch back for a new approval.
+ 'payout.release':(s,p,{actor,can})=>{
+  const g=finGate(s,actor,can,'release');if(g)return fail(g);
+  const b=s.payout_batches.find(x=>x.id===p.batchId);if(!b)return fail('missing');
+  if(b.state==='Processing')return ok({batchId:b.id,existing:true});if(b.state!=='Approved')return fail('p8.finInvalidTransition');
+  const problem=batchProblem(s,b);if(problem){invalidateApproval(s,actor,b,problem);return ok({batchId:b.id,state:'UnderReview',invalidated:problem});}
+  const transfer=`DEMO-TRANSFER-${b.id.slice(3)}-${b.transfer_attempt_ids.length+1}`;b.transfer_attempt_ids=[...b.transfer_attempt_ids,transfer];
+  for(const id of b.allocation_ids){const a=s.earning_allocations.find(x=>x.id===id);shift(s,a,'in_payout','PROCESS',['teacher_payout',payoutFor(s,b,a).id]);}
+  for(const x of s.teacher_payouts.filter(v=>v.batch_id===b.id))x.provider_ref=transfer;
+  setBatch(s,b,'Processing',{released_by:actor.user_id,released_at:DEMO_NOW});audit(s,actor,'payout_batch.release','payout_batch',b.id,'Approved','Processing',transfer);
+  return ok({batchId:b.id,transfer});
+ },
+ // Simulated provider confirmation + reconciliation. Idempotent: a Paid batch is never paid twice.
+ 'payout.confirm':(s,p,{actor,can})=>{
+  const g=finGate(s,actor,can,'release');if(g)return fail(g);
+  const b=s.payout_batches.find(x=>x.id===p.batchId);if(!b)return fail('missing');
+  if(b.state==='Paid')return ok({batchId:b.id,existing:true});if(b.state!=='Processing')return fail('p8.finInvalidTransition');
+  for(const id of b.allocation_ids){const a=s.earning_allocations.find(x=>x.id===id),tp=payoutFor(s,b,a);post(s,'PAID',a.id,['teacher_payout',tp.id],a.teacher_id,[['teacher_in_payout',a.amount_baisa,0],['provider_clearing',0,a.amount_baisa]]);Object.assign(a,{state:'paid',updated_at:DEMO_NOW});}
+  setBatch(s,b,'Paid',{paid_at:DEMO_NOW,reconciled_at:DEMO_NOW,confirmed_by:actor.user_id});
+  for(const tp of s.teacher_payouts.filter(x=>x.batch_id===b.id)){tp.reconciled_at=DEMO_NOW;const amount=omrText(tp.amount_baisa);
+   notifyUser(s,s.teachers.find(x=>x.id===tp.teacher_id)?.user_id,{event:'payout-paid-'+tp.id,type:'payout_paid',title:{ar:'تم صرف المستحقات',en:'Payout completed'},body:{ar:`تم تحويل ${amount.ar} إلى حسابك الموثق (${tp.provider_ref}).`,en:`${amount.en} was transferred to your verified account (${tp.provider_ref}).`},href:'#/teacher/earnings?tab=payouts&record='+tp.id,courseId:null});}
+  audit(s,actor,'payout_batch.confirm','payout_batch',b.id,'Processing','Paid',b.transfer_attempt_ids.at(-1)??'');
+  return ok({batchId:b.id});
+ },
+ // Simulated transfer failure: a reversing journal returns funds to reserved; nothing is marked paid.
+ 'payout.fail':(s,p,{actor,can})=>{
+  const g=finGate(s,actor,can,'release');if(g)return fail(g);
+  const b=s.payout_batches.find(x=>x.id===p.batchId);if(!b)return fail('missing');
+  if(b.state==='Failed')return ok({batchId:b.id,existing:true});if(b.state!=='Processing')return fail('p8.finInvalidTransition');
+  for(const id of b.allocation_ids){const a=s.earning_allocations.find(x=>x.id===id),base='J-PROCESS-'+a.id,entry=s.financial_ledger_entries.filter(e=>(e.journal_id===base||e.journal_id.startsWith(base+'-'))&&e.account==='teacher_in_payout'&&e.credit_baisa>0).at(-1);shift(s,a,'reserved','REVERSE',['teacher_payout',payoutFor(s,b,a).id],entry?.id??null);}
+  setBatch(s,b,'Failed',{failure_reason:'simulated_transfer_rejected',failed_at:DEMO_NOW});audit(s,actor,'payout_batch.fail','payout_batch',b.id,'Processing','Failed','simulated_transfer_rejected');
+  notifyUser(s,b.prepared_by,{event:`payout-failed-${b.id}-${s.audit_events.length}`,type:'payout_failed',title:{ar:'فشل تحويل دفعة',en:'Payout transfer failed'},body:{ar:`فشل تحويل الدفعة ${b.id} ويحتاج إعادة تحقق.`,en:`Batch ${b.id} failed and needs revalidation.`},href:'#/admin/finance/payouts/'+b.id,courseId:null});
+  return ok({batchId:b.id});
+ },
+ // Failed → UnderReview: same reserved selection (never re-selected), refreshed verified destinations, approval cleared.
+ 'payout.revalidate':(s,p,{actor,can})=>{
+  const g=finGate(s,actor,can,'release');if(g)return fail(g);
+  const b=s.payout_batches.find(x=>x.id===p.batchId);if(!b)return fail('missing');if(b.state!=='Failed')return fail('p8.finInvalidTransition');
+  if(b.destination_snapshots.some(d=>accountOf(s,d.teacher_id)?.verification_state!=='verified'))return fail('p8.finNoVerifiedAccount');
+  b.destination_snapshots=b.destination_snapshots.map(d=>destinationOf(accountOf(s,d.teacher_id)));
+  setBatch(s,b,'UnderReview',{approved_by:null,approved_at:null,last_failure:b.failure_reason,failure_reason:'',revalidated_at:DEMO_NOW,revalidated_by:actor.user_id});
+  audit(s,actor,'payout_batch.revalidate','payout_batch',b.id,'Failed','UnderReview');
+  return ok({batchId:b.id});
+ },
+ 'refund.request':(s,p,{actor,can})=>{
+  const g=finGate(s,actor,can,'refund');if(g)return fail(g);
+  const item=s.order_items.find(i=>i.id===p.orderItemId);if(!item)return failFields({orderItemId:'error.required'});
+  const order=s.orders.find(o=>o.id===item.order_id);
+  if(!['paid','partially_refunded'].includes(order.state)||!saleAllocation(s,item.id))return failFields({orderItemId:'p8.finNotRefundable'});
+  if(s.refunds.some(r=>r.order_item_id===item.id&&r.state!=='rejected'))return failFields({orderItemId:'p8.finRefundExists'});
+  const r=reasonOf(p.reason);if(r.error)return failFields({reason:r.error});
+  const ref={id:nextId(s.refunds,'REF'),order_id:order.id,order_item_id:item.id,amount_baisa:item.total_baisa,reason:typed(r.value),state:'requested',requested_by:actor.user_id,approved_by:null,access_effect:'revoke_purchase_grant',adjustment_id:null,created_at:DEMO_NOW,updated_at:DEMO_NOW};
+  s.refunds.push(ref);audit(s,actor,'refund.request','refund',ref.id,'','requested',r.value);return ok({refundId:ref.id});
+ },
+ 'refund.decide':(s,p,{actor,can})=>{
+  const g=finGate(s,actor,can,'refund');if(g)return fail(g);
+  const ref=s.refunds.find(r=>r.id===p.refundId);if(!ref)return fail('missing');
+  const from={review:['requested'],approve:['requested','under_review'],reject:['requested','under_review']}[p.decision];if(!from)return fail('invalidAction');
+  if(!from.includes(ref.state))return fail('p8.finInvalidTransition');
+  const r=reasonOf(p.reason);if(p.decision==='reject'&&r.error)return failFields({reason:r.error});
+  const before=ref.state,to={review:'under_review',approve:'approved',reject:'rejected'}[p.decision];
+  Object.assign(ref,{state:to,updated_at:DEMO_NOW},p.decision==='approve'?{approved_by:actor.user_id}:{},p.decision==='reject'?{rejected_reason:r.value}:{});
+  audit(s,actor,'refund.'+p.decision,'refund',ref.id,before,to,r.error?'':r.value);return ok({refundId:ref.id,state:to});
+ },
+ // Item-level refund outcome. Success reverses only this item's share, revokes only this item's purchase grant and
+ // moves the order to partially_refunded/refunded; a failure changes no money or access and can be re-simulated.
+ 'refund.simulate':(s,p,{actor,can})=>{
+  const g=finGate(s,actor,can,'refund');if(g)return fail(g);
+  const ref=s.refunds.find(r=>r.id===p.refundId);if(!ref)return fail('missing');
+  if(!['success','failure'].includes(p.outcome))return fail('invalidAction');
+  if(ref.state==='succeeded')return p.outcome==='success'?ok({refundId:ref.id,existing:true}):fail('p8.finRefundSettled');
+  if(!['approved','failed'].includes(ref.state))return fail('p8.finInvalidTransition');
+  const before=ref.state;
+  if(p.outcome==='failure'){Object.assign(ref,{state:'failed',failure_reason:'simulated_provider_refund_failure',updated_at:DEMO_NOW});audit(s,actor,'refund.fail','refund',ref.id,before,'failed');return ok({refundId:ref.id,state:'failed'});}
+  const item=s.order_items.find(i=>i.id===ref.order_item_id),order=s.orders.find(o=>o.id===ref.order_id);
+  if(activeDispute(s,item.id))return fail('p8.finDisputeOpen');
+  const res=reverseSale(s,item,{refundId:ref.id,reason:{ar:'استرداد عنصر طلب: عكس حصة المعلم المرتبطة.',en:'Order item refund: linked teacher share reversed.'}});if(res.error)return fail(res.error);
+  const revoked=[];for(const gr of s.access_grants.filter(x=>x.source_id===item.id&&x.status==='active')){Object.assign(gr,{status:'revoked',revoked_by:actor.user_id,revoke_reason:'refund '+ref.id,updated_at:DEMO_NOW});revoked.push(gr.id);}
+  Object.assign(ref,{state:'succeeded',approved_by:ref.approved_by??actor.user_id,adjustment_id:res.adjustment.id,processed_at:DEMO_NOW,updated_at:DEMO_NOW});
+  const all=s.order_items.filter(i=>i.order_id===order.id&&saleAllocation(s,i.id)).every(i=>s.refunds.some(r=>r.order_item_id===i.id&&r.state==='succeeded'));
+  const orderBefore=order.state;order.state=all?'refunded':'partially_refunded';order.updated_at=DEMO_NOW;
+  const tx=s.payment_transactions.filter(x=>x.order_id===order.id&&['succeeded','partially_refunded'].includes(x.state)).at(-1);if(tx)Object.assign(tx,{state:order.state,updated_at:DEMO_NOW});
+  audit(s,actor,'refund.succeed','refund',ref.id,`${before} · ${orderBefore}`,`succeeded · ${order.state}`,revoked.join(', '));
+  notifyUser(s,order.buyer_user_id,{event:'refund-'+ref.id,type:'refund',title:{ar:'تم استرداد عنصر من طلبك',en:'An item in your order was refunded'},body:structuredClone(item.title_snapshot),href:buyerHref(s,order),courseId:null});
+  notifyUser(s,s.teachers.find(x=>x.id===res.allocation.teacher_id)?.user_id,{event:'refund-adjustment-'+ref.id,type:'earning_adjusted',title:{ar:'تعديل على مستحقاتك بسبب استرداد',en:'Earnings adjusted after a refund'},body:structuredClone(item.title_snapshot),href:'#/teacher/earnings?tab=sales',courseId:null});
+  return ok({refundId:ref.id,adjustmentId:res.adjustment.id,revoked,orderState:order.state});
+ },
+ // Disputes hold the item's unpaid allocation in reserved; won releases it to its prior state; lost reverses it.
+ 'dispute.open':(s,p,{actor,can})=>{
+  const g=finGate(s,actor,can,'refund');if(g)return fail(g);
+  const item=s.order_items.find(i=>i.id===p.orderItemId);if(!item)return failFields({orderItemId:'error.required'});
+  const order=s.orders.find(o=>o.id===item.order_id),a=saleAllocation(s,item.id);
+  if(!['paid','partially_refunded'].includes(order.state)||!a||s.refunds.some(r=>r.order_item_id===item.id&&r.state==='succeeded'))return failFields({orderItemId:'p8.finNotRefundable'});
+  if(activeDispute(s,item.id))return failFields({orderItemId:'p8.finDisputeOpen'});
+  const r=reasonOf(p.reason);if(r.error)return failFields({reason:r.error});
+  const d={id:nextId(s.disputes,'DIS'),order_item_id:item.id,state:'open',reason:typed(r.value),held_allocation_ids:[],held_from:{},opened_by:actor.user_id,created_at:DEMO_NOW,updated_at:DEMO_NOW};s.disputes.push(d);
+  if(['pending','available'].includes(a.state)&&!batchOfAllocation(s,a.id)){d.held_from[a.id]=a.state;shift(s,a,'reserved','HOLD',['dispute',d.id]);d.held_allocation_ids.push(a.id);}
+  audit(s,actor,'dispute.open','dispute',d.id,'','open',r.value);return ok({disputeId:d.id,held:[...d.held_allocation_ids]});
+ },
+ 'dispute.decide':(s,p,{actor,can})=>{
+  const g=finGate(s,actor,can,'refund');if(g)return fail(g);
+  const d=s.disputes.find(x=>x.id===p.disputeId);if(!d)return fail('missing');
+  const from={review:['open'],won:['open','under_review'],lost:['open','under_review']}[p.decision];if(!from)return fail('invalidAction');
+  if(!from.includes(d.state))return fail('p8.finInvalidTransition');
+  const r=reasonOf(p.reason);if(p.decision!=='review'&&r.error)return failFields({reason:r.error});
+  const before=d.state,held=d.held_allocation_ids.map(id=>s.earning_allocations.find(a=>a.id===id)).filter(a=>a?.state==='reserved');
+  if(p.decision==='won')for(const a of held)shift(s,a,d.held_from?.[a.id]??'available','UNHOLD',['dispute',d.id]);
+  if(p.decision==='lost'){const res=reverseSale(s,s.order_items.find(i=>i.id===d.order_item_id),{disputeId:d.id,reason:{ar:'نزاع خاسر: عكس حصة المعلم المرتبطة.',en:'Lost dispute: linked teacher share reversed.'}});if(res.error)return fail(res.error);d.adjustment_id=res.adjustment.id;}
+  Object.assign(d,{state:{review:'under_review',won:'won',lost:'lost'}[p.decision],updated_at:DEMO_NOW},p.decision==='review'?{}:{decided_by:actor.user_id,decided_at:DEMO_NOW});
+  audit(s,actor,'dispute.'+p.decision,'dispute',d.id,before,d.state,r.error?'':r.value);return ok({disputeId:d.id,state:d.state});
+ },
+ // Evidence-backed manual match for a reconciliation exception; automatically matched lines need no mark.
+ 'reconciliation.mark':(s,p,{actor,can})=>{
+  const g=finGate(s,actor,can,'reconcile');if(g)return fail(g);
+  const line=reconLines(s).find(l=>l.key===p.key);if(!line)return fail('missing');
+  if(line.status==='matched')return fail('p8.finAlreadyMatched');if(line.status==='matched_manual')return ok({key:line.key,existing:true});
+  const r=reasonOf(p.note??p.reason);if(r.error)return failFields({note:r.error});
+  const record=reconRecord(s,line.key);record.reconciliation={state:'matched_manual',note:r.value,by:actor.user_id,at:DEMO_NOW};record.updated_at=DEMO_NOW;
+  audit(s,actor,'reconciliation.mark',{payment:'payment_transaction',refund:'refund',payout:'teacher_payout'}[line.kind],record.id,line.reason??'exception','matched_manual',r.value);
+  return ok({key:line.key});
+ },
+ // Illustrative tax/invoice demo configuration. Its status can never become confirmed and checkout taxes stay zero.
+ 'finance.saveTaxConfig':(s,p,{actor,can})=>{
+  const g=finGate(s,actor,can);if(g)return fail(g);
+  const set=s.platform_settings[0];
+  if(p.section==='tax'){
+   const n=bilingual(p,'tax_label',3,80),rate=percentBps(p.rate),reg=text(p.registration,40);
+   const errors=pick({...n.errors,rate:rate===null?'p8.finRateInvalid':null,registration:reg&&!/^[A-Za-z0-9 -]{3,40}$/.test(reg)?'p8.finRegistrationInvalid':null});if(Object.keys(errors).length)return failFields(errors);
+   const before=`${set.tax_config.rate_bps??0}bps`;set.tax_config={status:'unconfirmed',label:n.value,rate_bps:rate,registration:reg,inclusive:p.inclusive===true||p.inclusive==='on',updated_by:actor.user_id,updated_at:DEMO_NOW};
+   audit(s,actor,'finance.tax_config','platform_settings',set.id,before,`${rate}bps · unconfirmed`);return ok({section:'tax'});
+  }
+  if(p.section==='invoices'){
+   const issuer=bilingual(p,'issuer',3,120),footer=bilingual(p,'footer',5,300),prefix=text(p.prefix,8).toUpperCase(),start=intIn(p.next_number,1,999999);
+   const errors=pick({...issuer.errors,...footer.errors,prefix:/^[A-Z]{2,6}$/.test(prefix)?null:'p8.finPrefixInvalid',next_number:start===null?'p8.finNumberInvalid':null});if(Object.keys(errors).length)return failFields(errors);
+   const before=set.invoice_config.prefix??'';set.invoice_config={status:'demo',prefix,next_number:start,issuer:issuer.value,footer:footer.value,updated_by:actor.user_id,updated_at:DEMO_NOW};
+   audit(s,actor,'finance.invoice_config','platform_settings',set.id,before,`${prefix} · demo`);return ok({section:'invoices'});
+  }
+  return fail('invalidAction');
  },
 });
