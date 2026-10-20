@@ -205,7 +205,7 @@ function stepState(d, step) {
   return !check ? 'todo' : check.ok ? 'done' : check.blocking ? 'attention' : 'todo';
 }
 function stepperNav(d, current) {
-  return `<nav aria-label="${esc(label('wizardSteps'))}" class="mb-6"><ol class="wizard-steps">${COURSE_STEPS.map((s, i) => {
+  return `<nav aria-label="${esc(label('wizardSteps'))}" class="wizard-stepper-wrap mb-6"><ol class="wizard-steps">${COURSE_STEPS.map((s, i) => {
     const state = stepState(d, s), inner = `<span class="wizard-num">${state === 'done' ? icon('check', { size: 16 }) : `<bdi>${i + 1}</bdi>`}</span><span class="min-w-0"><span class="block font-semibold text-sm">${esc(label('step.' + s))}</span><span class="block text-xs muted">${esc(label('stepState.' + (s === current ? 'current' : state)))}</span></span>`;
     return `<li>${state === 'locked' ? `<span class="wizard-step is-locked" aria-disabled="true" title="${esc(label('saveFirstBody'))}">${inner}</span>` : `<a class="wizard-step is-${state}" href="${esc(editLink(d.isNew ? null : d.course.id, s))}" ${s === current ? 'aria-current="step"' : ''}>${inner}</a>`}</li>`;
   }).join('')}</ol></nav>`;

@@ -648,7 +648,7 @@ export function portalLayout(body, ctx) {
     <header class="topbar">
       <div class="flex items-center gap-2 min-w-0">
         <span class="mobile-nav-trigger">${iconButton({ label: t('menu'), icon: 'menu', action: 'overlay.open', data: { id: 'portal-nav' }, expanded: false, controls: 'portal-nav' })}</span>
-        <div class="min-w-0">${breadcrumb(crumbs)}</div>
+        <div class="min-w-0 hidden sm:block font-semibold truncate">${esc(crumbs.at(-1)?.label ?? '')}</div>
       </div>
       <div class="flex items-center gap-1 shrink-0">
         <span class="hidden sm:inline-flex me-2">${demoBadge()}</span>

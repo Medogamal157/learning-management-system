@@ -1412,6 +1412,18 @@ Object.assign(dictionary, {
     "ar": "الدورات",
     "en": "Courses"
   },
+  "availableSubjects": {
+    "ar": "المواد المتاحة",
+    "en": "Available subjects"
+  },
+  "courses": {
+    "ar": "الدورات",
+    "en": "Courses"
+  },
+  "noCoursesYet": {
+    "ar": "لا توجد دورات بعد",
+    "en": "No courses yet"
+  },
   "p2.catalogIntro": {
     "ar": "ابدأ بصفك، واختر المادة وطريقة التعلم المناسبة لك.",
     "en": "Start with your grade, then find your subject and learning format."
