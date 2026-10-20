@@ -5,6 +5,7 @@ import { createSeed, PERSONAS, DEMO_NOW, ENUMS } from '../prototype/core/data.js
 import { select, dispatch, can, getState, resetDemoData } from '../prototype/core/store.js';
 import { dictionary, money, t, L, esc } from '../prototype/core/i18n.js';
 import { routes } from '../prototype/core/router.js';
+import * as adminViews from '../prototype/views/admin.js';
 
 let passed = 0;
 const check = (name, fn) => {
@@ -1347,5 +1348,245 @@ for(const lang of ['ar','en']){
 dictionary.unknown=unknownEntry;
 resetDemoData();dispatch('preferences.set',{role:'visitor',lang:'ar'});
 console.log(`P7 render smoke: ${p7Renders} renders`);
+
+// ---------------------------------------------------------------- P8a administration (all modules except finance)
+const p8Reset=(role='admin_moderation')=>{resetDemoData();dispatch('preferences.set',{role,lang:'ar'});};
+const audits=()=>getState().audit_events;
+const identityOf=id=>{const c=getState().courses.find(x=>x.id===id);return Object.fromEntries(['title','summary','description'].flatMap(k=>[[k+'_ar',c[k].ar],[k+'_en',c[k].en]]));};
+const P8_ROUTES=routes.filter(r=>r.module==='admin'&&!r.path.startsWith('/admin/finance'));
+const O_ONLY=['/admin/people/employees','/admin/academics/curricula','/admin/academics/grades','/admin/academics/subjects','/admin/academics/periods','/admin/academics/translations','/admin/cms/home','/admin/cms/pages','/admin/cms/promotions','/admin/notifications','/admin/reports','/admin/settings/roles','/admin/settings/security','/admin/settings/integrations','/admin/settings/policies'];
+check('P8a routes: 27 views wired, finance stays placeholder, role arrays scoped',()=>{
+ assert.equal(P8_ROUTES.length,27);
+ for(const r of P8_ROUTES){assert.ok(!r.view.render.toString().includes('coming'),r.path);assert.ok(!r.roles.includes('admin_finance'),r.path);assert.deepEqual(r.roles,O_ONLY.includes(r.path)?['super_admin']:['admin_moderation','super_admin'],r.path);}
+ for(const r of routes.filter(r=>r.path.startsWith('/admin/finance')))assert.ok(r.view.render.toString().includes('coming'),r.path);
+});
+check('P8a scope: admin_finance gets nothing from people/course/support selectors or reducers',()=>{
+ p8Reset('admin_finance');const pre=getState();
+ for(const name of ['admin.dashboard','admin.students','admin.guardianLinks','admin.teachers','admin.employees','admin.teams','admin.academics','admin.reviewQueue','admin.catalog','admin.contentReports','admin.access','admin.live','admin.tickets','admin.flags','admin.communications','admin.cms','admin.notifications','admin.reports','admin.roles','admin.security','admin.integrations','admin.policies'])assert.equal(select(name,{}),null,name);
+ for(const name of ['admin.student','admin.guardianLink','admin.application','admin.teacher','admin.course','admin.ticket','admin.communication'])assert.equal(select(name,{id:'S-001'}).status,'denied',name);
+ for(const [type,payload] of [['admin.sensitiveRead',{type:'student',id:'S-001',reason:'Finance check'}],['guardianLink.decide',{linkId:'GL-003',decision:'verify',reason:'Evidence matched'}],['guardianLink.verify',{linkId:'GL-003'}],['application.review',{applicationId:'TA-004',decision:'approve'}],['people.setAccountStatus',{kind:'student',id:'S-001',status:'suspended',reason:'Test reason'}],['people.inviteTeacher',{email:'x@example.test',days:'7'}],['course.review',{courseId:'C-012',decision:'approve'}],['course.moderate',{courseId:'C-001',action:'unpublish',reason:'Test reason'}],['access.adminGrant',{studentId:'S-001',courseId:'C-001',ends:'2027-07-31',reason:'Test reason'}],['support.resolveTicket',{ticketId:'ST-001',reason:'Test reason'}],['cms.saveHome',{}],['academics.saveTranslations',{subjects:{math:{ar:'x',en:'y'}}}],['roles.save',{assignmentId:'RA-005',permissions:['finance.refund'],reason:'Test reason'}],['delivery.retry',{attemptId:'DA-010'}],['team.adminRevoke',{memberId:'TM-001',reason:'Test reason'}]])assert.equal(dispatch(type,payload).errorKey,'resourceDenied',type);
+ assert.equal(getState(),pre,'no mutation');
+ // Role-denied route screen and the view guard both leak no learner names.
+ for(const path of ['/admin/people/students','/admin/people/guardian-links','/admin/support/tickets']){const {html,ctx}=p6Render(path,{},'record=S-001');assert.equal(html,fallback('resourceDenied',ctx),path);for(const id of ['S-001','S-003'])assert.ok(!html.includes(esc(L(student(id).name))),path);}
+ assert.ok(fallback('roleDenied',{role:'admin_finance'},{roles:['admin_moderation','super_admin']}).includes('shell.retryRole'));
+});
+check('P8a scope: admin_moderation sees review/safety queues only; no employees, academics, CMS, settings or finance',()=>{
+ p8Reset();const d=select('admin.dashboard');assert.equal(d.finance,null);assert.equal(d.academic,null);assert.ok(d.queues.courseReview>=2&&d.queues.guardianLinks>=1);
+ assert.deepEqual(select('admin.scope'),{people:true,courses:true,support:true,academics:false,cms:false,notifications:false,reports:false,settings:false,employees:false,finance:false});
+ for(const name of ['admin.employees','admin.academics','admin.cms','admin.notifications','admin.reports','admin.roles','admin.security','admin.integrations','admin.policies'])assert.equal(select(name,{}),null,name);
+ const pre=getState();
+ for(const [type,payload] of [['people.inviteEmployee',{name:'New Staff',email:'n@example.test',role:'admin_moderation',days:'30'}],['people.updateEmployee',{assignmentId:'RA-005',status:'suspended',reason:'Test reason'}],['academics.saveCurriculum',{code:'NEW',name_ar:'منهج جديد',name_en:'New curriculum'}],['academics.toggleMapping',{gradeId:'4',subjectId:'math'}],['academics.updateGrade',{id:'4',name_ar:'الصف',name_en:'Grade',cycle_ar:'الحلقة',cycle_en:'Cycle'}],['cms.saveHome',{}],['cms.savePage',{slug:'about'}],['template.save',{templateId:'NT-001'}],['roles.save',{assignmentId:'RA-006'}],['security.update',{userId:'U-F001',action:'resetMfa',reason:'Test reason'}],['integration.test',{key:'payment'}]])assert.equal(dispatch(type,payload).errorKey,'resourceDenied',type);
+ assert.equal(getState(),pre);
+ for(const path of O_ONLY){const {html,ctx}=p6Render(path);assert.equal(html,fallback('resourceDenied',ctx),path);}
+ p8Reset('super_admin');const o=select('admin.dashboard');assert.ok(o.finance&&Number.isInteger(o.finance.gross)&&o.finance.gross>0);assert.ok(o.academic.mappings===60);
+});
+check('P8a sensitive read requires a reason, appends an audit event and unlocks for this persona session only',()=>{
+ p8Reset();const locked=select('admin.student',{id:'S-001'});assert.equal(locked.locked,true);assert.equal(locked.student.email,undefined);assert.equal(locked.courses,undefined);
+ const n=audits().length;
+ assert.equal(dispatch('admin.sensitiveRead',{type:'student',id:'S-001',reason:''}).fieldErrors.reason,'p8.reasonRequired');
+ assert.equal(dispatch('admin.sensitiveRead',{type:'student',id:'S-001',reason:'abc'}).fieldErrors.reason,'p8.reasonShort');
+ assert.equal(dispatch('admin.sensitiveRead',{type:'student',id:'S-999',reason:'Ticket ST-002'}).errorKey,'missing');assert.equal(audits().length,n);
+ assert.ok(dispatch('admin.sensitiveRead',{type:'student',id:'S-001',reason:'Support ticket ST-001 follow-up'}).ok);
+ const e=audits().at(-1);assert.deepEqual([e.actor_user_id,e.action,e.resource_type,e.resource_id,e.reason],['U-M001','support.sensitive_read','student','S-001','Support ticket ST-001 follow-up']);
+ const open=select('admin.student',{id:'S-001'});assert.equal(open.locked,false);assert.ok(open.student.email.endsWith('@example.test'));assert.ok(open.guardians.length>=2);
+ for(const [type,id] of [['guardian_link','GL-003'],['ticket','ST-001'],['safety_report','SR-001'],['message','MSG-021']])assert.ok(dispatch('admin.sensitiveRead',{type,id,reason:'Moderation review'}).ok,type);
+ assert.equal(audits().length,n+5);assert.equal(select('admin.ticket',{id:'ST-001'}).locked,false);assert.ok(select('admin.flags').flagged.find(m=>m.id==='MSG-021').text);
+ assert.equal(dispatch('support.staffRespond',{ticketId:'ST-002',text:'Hello'}).errorKey,'p8.reasonFirst','reply needs a reasoned read');
+ dispatch('preferences.set',{role:'super_admin'});assert.equal(select('admin.student',{id:'S-001'}).locked,true,'cleared on role switch');
+});
+check('P8a scenario 4: OMAN-S003 request → moderator verifies evidence → guardian sees S-003 → revoke hides it',()=>{
+ p8Reset('guardian');assert.equal(can('child.read',student('S-003')),false);
+ const req=dispatch('guardian.requestLink',{code:'OMAN-S003',relationship:'aunt',consent:true});assert.ok(req.ok&&req.data.reused&&req.data.linkId==='GL-003');
+ dispatch('preferences.set',{role:'admin_moderation'});
+ assert.ok(select('admin.guardianLinks',{state:'queue'}).rows.some(r=>r.id==='GL-003'));
+ assert.equal(select('admin.guardianLink',{id:'GL-003'}).locked,true);
+ assert.ok(dispatch('admin.sensitiveRead',{type:'guardian_link',id:'GL-003',reason:'Verify synthetic evidence'}).ok);
+ const ev=select('admin.guardianLink',{id:'GL-003'}).evidence;assert.equal(ev.token,'OMAN-S003');assert.equal(ev.student.id,'S-003');assert.equal(ev.consent,true);
+ assert.equal(dispatch('guardianLink.decide',{linkId:'GL-003',decision:'verify',reason:''}).fieldErrors.reason,'p8.reasonRequired');
+ assert.ok(dispatch('guardianLink.decide',{linkId:'GL-003',decision:'verify',reason:'Token and consent matched'}).ok);
+ assert.equal(getState().guardian_student_links.find(l=>l.id==='GL-003').verified_by,'U-M001');
+ assert.equal(dispatch('guardianLink.decide',{linkId:'GL-003',decision:'verify',reason:'Again please'}).errorKey,'p5.invalidTransition');
+ dispatch('preferences.set',{role:'guardian'});
+ assert.deepEqual(select('guardian.children').map(s=>s.id),['S-001','S-002','S-003']);assert.equal(select('guardian.child',{id:'S-003'}).status,'ok');
+ assert.ok(dispatch('guardian.revokeLink',{linkId:'GL-003'}).ok);
+ assert.deepEqual(select('guardian.children').map(s=>s.id),['S-001','S-002']);assert.equal(select('guardian.child',{id:'S-003'}).status,'denied');
+ assert.ok(!select('guardian.purchaseChildren').some(c=>c.id==='S-003'));
+ // Moderator decisions: reject, revoke and scope-change requests, each with a reason.
+ dispatch('preferences.set',{role:'guardian'});assert.ok(dispatch('guardian.requestScopeChange',{linkId:'GL-002',scopes:['progress','results']}).ok);
+ dispatch('preferences.set',{role:'admin_moderation'});
+ assert.ok(dispatch('guardianLink.decide',{linkId:'GL-002',decision:'approveScope',reason:'Guardian asked to narrow scopes'}).ok);
+ assert.deepEqual(getState().guardian_student_links.find(l=>l.id==='GL-002').scopes,['progress','results']);
+ assert.equal(dispatch('guardianLink.decide',{linkId:'GL-002',decision:'rejectScope',reason:'Nothing pending'}).errorKey,'p8.noScopeRequest');
+ assert.ok(dispatch('guardianLink.decide',{linkId:'GL-005',decision:'revoke',reason:'Safeguarding concern review'}).ok);
+ assert.equal(dispatch('guardianLink.decide',{linkId:'GL-006',decision:'reject',reason:'Already rejected'}).errorKey,'p5.invalidTransition');
+ dispatch('preferences.set',{role:'guardian'});assert.ok(select('guardian.children').some(s=>s.id==='S-001'),'G-001 S-001 unaffected by G-002 revoke');
+});
+check('P8a scenario 5: admin queue request changes → teacher resubmits → approve → public grade4 Math catalog; revision swaps snapshot',()=>{
+ p8Reset('teacher');const id=p6Create();p6Prepare(id);assert.ok(dispatch('course.submit',{courseId:id}).ok);
+ dispatch('preferences.set',{role:'visitor'});assert.ok(!select('catalog.search',{grade:'4',subject:'math'}).some(c=>c.id===id));
+ dispatch('preferences.set',{role:'admin_moderation'});
+ const row=select('admin.reviewQueue').find(c=>c.id===id);assert.ok(row);assert.equal(row.kind,'new');
+ const detail=select('admin.course',{id});assert.equal(detail.qualified,true);assert.ok(detail.checklist.every(x=>!x.blocking||x.ok));
+ assert.ok(dispatch('course.review',{courseId:id,decision:'requestChanges',feedback:'Please add a worked example to the preview.'}).ok);
+ assert.ok(!select('admin.reviewQueue').some(c=>c.id===id));
+ const teacherUser=getState().teachers.find(x=>x.id==='T-001').user_id;assert.ok(getState().notifications.some(n=>n.recipient_user_id===teacherUser&&n.type==='review_feedback'));
+ dispatch('preferences.set',{role:'teacher'});assert.ok(dispatch('course.submit',{courseId:id}).ok);
+ dispatch('preferences.set',{role:'admin_moderation'});assert.ok(select('admin.reviewQueue').some(c=>c.id===id));
+ assert.ok(dispatch('course.review',{courseId:id,decision:'approve'}).ok);
+ dispatch('preferences.set',{role:'visitor'});assert.ok(select('catalog.search',{grade:'4',subject:'math'}).some(c=>c.id===id));
+ // Published edit → pending revision; public keeps the old snapshot until approval in the same queue.
+ dispatch('preferences.set',{role:'teacher'});const before=L(select('course.public',{id:'C-001'}).summary);
+ assert.ok(dispatch('course.saveDraft',{courseId:'C-001',step:'identity',values:{...identityOf('C-001'),summary_en:'A revised summary with worked examples',summary_ar:'ملخص منقح مع أمثلة محلولة'}}).ok);
+ assert.ok(dispatch('course.submit',{courseId:'C-001'}).ok);
+ dispatch('preferences.set',{role:'admin_moderation'});const rev=select('admin.reviewQueue').find(c=>c.id==='C-001');assert.equal(rev.kind,'revision');
+ assert.ok(select('admin.course',{id:'C-001'}).revision.some(r=>r.field==='summary'));
+ dispatch('preferences.set',{role:'visitor'});assert.equal(L(select('course.public',{id:'C-001'}).summary),before);
+ dispatch('preferences.set',{role:'admin_moderation'});assert.ok(dispatch('course.review',{courseId:'C-001',decision:'approve'}).ok);
+ dispatch('preferences.set',{role:'visitor',lang:'en'});assert.equal(L(select('course.public',{id:'C-001'}).summary),'A revised summary with worked examples');dispatch('preferences.set',{lang:'ar'});
+});
+check('P8a scenario 5: qualification re-validated in admin inspection when the mapping is no longer valid',()=>{
+ p8Reset('super_admin');assert.equal(select('admin.course',{id:'C-012'}).qualified,true);
+ assert.ok(dispatch('academics.toggleMapping',{gradeId:'5',subjectId:'math'}).ok);
+ assert.equal(getState().courses.find(c=>c.id==='C-012').grade_subject_id,'GS-5-math','classification retained');
+ assert.equal(select('admin.course',{id:'C-012'}).qualified,false);assert.equal(dispatch('course.review',{courseId:'C-012',decision:'approve'}).errorKey,'p6.notQualified');
+ assert.ok(dispatch('academics.toggleMapping',{gradeId:'5',subjectId:'math'}).ok);assert.ok(dispatch('course.review',{courseId:'C-012',decision:'approve'}).ok);
+});
+check('P8a scenario 6: T-004 more info → applicant resubmits → approve; directory shows zero courses; invitation is distinct',()=>{
+ p8Reset();const n=getState().courses.length;
+ assert.ok(select('admin.teachers').applications.some(a=>a.id==='TA-004'&&a.state==='submitted'));
+ assert.equal(dispatch('application.review',{applicationId:'TA-004',decision:'requestInfo',feedback:'short'}).fieldErrors.feedback,'error.messageShort');
+ assert.ok(dispatch('application.review',{applicationId:'TA-004',decision:'requestInfo',feedback:'Please attach your teaching licence file.'}).ok);
+ const app=()=>getState().teacher_applications.find(a=>a.id==='TA-004');assert.equal(app().state,'more_info_required');assert.deepEqual(app().history.slice(-2).map(h=>h.state),['under_review','more_info_required']);
+ assert.equal(dispatch('application.review',{applicationId:'TA-004',decision:'approve'}).errorKey,'p8.applicationNotPending');
+ dispatch('preferences.set',{role:'visitor'});
+ assert.ok(dispatch('application.saveStep',{step:'credentials',values:{credentials:[{label:'Teaching licence',filename:'licence.pdf'}]}}).ok);
+ assert.ok(dispatch('application.submit',{consent:true}).ok);assert.equal(app().state,'submitted');
+ dispatch('preferences.set',{role:'admin_moderation'});assert.ok(dispatch('application.review',{applicationId:'TA-004',decision:'approve'}).ok);
+ const t4=getState().teachers.find(x=>x.id==='T-004');assert.deepEqual([t4.application_status,t4.account_status,t4.verification_state],['approved','active','verified']);
+ assert.equal(getState().courses.length,n,'approval creates no courses');
+ dispatch('preferences.set',{role:'visitor'});const dir=select('teacherDirectory',{}).find(x=>x.id==='T-004');assert.ok(dir);assert.equal(dir.published_course_count,0);assert.deepEqual(select('teacher.public',{id:'T-004'}).courses,[]);
+ dispatch('preferences.set',{role:'admin_moderation'});
+ assert.equal(dispatch('people.inviteTeacher',{email:'someone@gmail.com',days:'14'}).fieldErrors.email,'p6.syntheticEmail');
+ const inv=dispatch('people.inviteTeacher',{email:'invited.teacher@example.test',days:'14'});assert.ok(inv.ok);
+ const row=select('admin.teachers').invitations.find(x=>x.id===inv.data.invitationId);assert.deepEqual([row.state,row.teacher_id],['invited',null]);
+ assert.equal(dispatch('people.inviteTeacher',{email:'invited.teacher@example.test',days:'14'}).fieldErrors.email,'p8.inviteExists');
+ assert.ok(!getState().teachers.some(x=>x.application_status==='approved'&&getState().users.find(u=>u.id===x.user_id)?.email==='invited.teacher@example.test'),'invited ≠ approved');
+ // Account suspension is separate from the application state.
+ assert.ok(dispatch('people.setAccountStatus',{kind:'teacher',id:'T-004',status:'suspended',reason:'Credential spot check'}).ok);
+ assert.deepEqual([getState().teachers.find(x=>x.id==='T-004').application_status,getState().teachers.find(x=>x.id==='T-004').account_status],['approved','suspended']);
+ dispatch('preferences.set',{role:'visitor'});assert.ok(!select('teacherDirectory',{}).some(x=>x.id==='T-004'));
+});
+check('P8a teams oversight, employees, catalog ops, reports, access and live incidents mutate the store',()=>{
+ p8Reset();
+ assert.equal(dispatch('team.adminRevoke',{memberId:'TM-001',courseId:'C-002',reason:''}).fieldErrors.reason,'p8.reasonRequired');
+ assert.ok(dispatch('team.adminRevoke',{memberId:'TM-001',courseId:'C-002',reason:'Course reassignment review'}).ok);
+ assert.equal(getState().course_team_assignments.find(a=>a.id==='CTA-002').status,'revoked');assert.equal(getState().course_team_assignments.find(a=>a.id==='CTA-001').status,'active');
+ dispatch('preferences.set',{role:'assistant'});assert.deepEqual(select('assistant.courses').courses.map(c=>c.id),['C-001']);
+ dispatch('preferences.set',{role:'admin_moderation'});
+ assert.equal(dispatch('course.moderate',{courseId:'C-004',action:'unpublish',reason:''}).fieldErrors.reason,'p8.reasonRequired');
+ assert.ok(dispatch('course.moderate',{courseId:'C-004',action:'unpublish',reason:'Takedown pending review'}).ok);
+ dispatch('preferences.set',{role:'visitor'});assert.equal(select('course.public',{id:'C-004'}),null);
+ dispatch('preferences.set',{role:'admin_moderation'});assert.ok(dispatch('course.moderate',{courseId:'C-004',action:'republish',reason:'Review complete, restored'}).ok);
+ dispatch('preferences.set',{role:'visitor'});assert.ok(select('course.public',{id:'C-004'}));
+ dispatch('preferences.set',{role:'admin_moderation'});assert.equal(dispatch('course.moderate',{courseId:'C-022',action:'republish',reason:'Not allowed from archive'}).errorKey,'p6.invalidTransition');
+ assert.ok(dispatch('report.act',{reportId:'SR-002',action:'restrict',reason:'Hold while reviewing'}).ok);assert.ok(getState().courses.find(c=>c.id==='C-001').content_restriction);
+ assert.ok(dispatch('report.act',{reportId:'SR-002',action:'resolve',reason:'Clarified with the owner'}).ok);assert.equal(getState().courses.find(c=>c.id==='C-001').content_restriction,null);
+ const g=dispatch('access.adminGrant',{studentId:'S-001',courseId:'C-001',ends:'2027-07-31',reason:'Scholarship demo grant'});assert.ok(g.ok);
+ const grant=getState().access_grants.find(x=>x.id===g.data.grantId);assert.deepEqual([grant.origin,grant.status,grant.source_id,grant.granted_by],['admin_grant','active',null,'U-M001']);
+ assert.equal(getState().orders.length,createSeed().orders.length,'no payment editing');
+ dispatch('preferences.set',{role:'student'});assert.equal(can('read_content',course('C-001')),true);
+ dispatch('preferences.set',{role:'admin_moderation'});assert.equal(dispatch('access.adminGrant',{studentId:'S-001',courseId:'C-001',ends:'2027-07-31',reason:'Duplicate grant'}).fieldErrors.courseId,'p8.grantExists');
+ assert.ok(dispatch('access.revokeGrant',{grantId:grant.id,reason:'Grant entered in error'}).ok);
+ dispatch('preferences.set',{role:'student'});assert.equal(can('read_content',course('C-001')),false);
+ dispatch('preferences.set',{role:'admin_moderation'});
+ assert.ok(dispatch('live.addIncident',{sessionId:'LS-001',note:'Provider latency reported by host.'}).ok);assert.equal(select('admin.live',{}).rows.find(x=>x.id==='LS-001').incidents.length,1);
+ assert.ok(select('admin.live',{status:'failed'}).rows.every(x=>x.status==='failed'));
+ assert.ok(dispatch('message.moderate',{messageId:'MSG-021',decision:'remove',reason:'Inappropriate language'}).ok);assert.ok(select('admin.flags').removed.some(m=>m.id==='MSG-021'));
+ assert.ok(dispatch('message.moderate',{messageId:'MSG-021',decision:'restore',reason:'Appeal accepted'}).ok);
+ assert.ok(dispatch('safety.setState',{reportId:'SR-001',state:'escalated',reason:'Needs owner decision'}).ok);
+ const ctxMsgs=(dispatch('admin.sensitiveRead',{type:'safety_report',id:'SR-001',reason:'Review reported context'}),select('admin.communication',{id:'SR-001'}).messages);
+ assert.ok(ctxMsgs.length<=5&&ctxMsgs.some(m=>m.reported)&&ctxMsgs.every(m=>getState().messages.find(x=>x.id===m.id).conversation_id===getState().messages.find(x=>x.id==='MSG-021').conversation_id&&!getState().messages.find(x=>x.id===m.id).internal),'reported thread context only');
+ p8Reset('super_admin');
+ const emp=dispatch('people.inviteEmployee',{name:'Demo Moderator',email:'demo.mod@example.test',role:'admin_moderation',days:'90'});assert.ok(emp.ok);
+ assert.ok(select('admin.employees').rows.some(r=>r.id===emp.data.assignmentId&&r.status==='invited'));
+ assert.equal(dispatch('people.updateEmployee',{assignmentId:'RA-007',status:'suspended',reason:'Self change'}).errorKey,'p8.ownerProtected');
+ assert.ok(dispatch('people.updateEmployee',{assignmentId:'RA-006',status:'suspended',reason:'Leave of absence'}).ok);
+});
+check('P8a scenario 11: O edits translation/banner/FAQ/template, resolves ticket with audit, retry keeps event ID',()=>{
+ p8Reset('super_admin');
+ assert.equal(dispatch('academics.saveTranslations',{subjects:{math:{ar:'الرياضيات',en:''}}}).fieldErrors.s_math_en,'p8.labelMissing');
+ assert.ok(dispatch('academics.saveTranslations',{subjects:{math:{ar:'الرياضيات المطورة',en:'Mathematics (revised)'}},mappings:{'GS-4-math':{ar:'رياضيات الرابع',en:'Grade 4 Maths'}}}).ok);
+ dispatch('preferences.set',{role:'visitor',lang:'en'});assert.equal(L(select('subjects').find(s=>s.id==='math').name),'Mathematics (revised)');
+ assert.ok(select('gradeLanding',{gradeId:'4'}).subjects.some(s=>L(s.display_name)==='Grade 4 Maths'));
+ const exp=p6Render('/explore');assert.ok(exp.html.includes('Mathematics (revised)'),'explore filter label');
+ dispatch('preferences.set',{role:'super_admin',lang:'ar'});
+ assert.equal(dispatch('cms.saveHome',{title_ar:'لافتة',title_en:'Banner',body_ar:'نص',body_en:'Text',featured:[]}).fieldErrors.featured,'p8.featuredRequired');
+ assert.ok(dispatch('cms.saveHome',{title_ar:'عام جديد مع معلمين معتمدين',title_en:'A new year with verified teachers',body_ar:'دورات لكل صف من الأول إلى الثاني عشر.',body_en:'Courses for every grade from 1 to 12.',featured:['C-005','C-001']}).ok);
+ dispatch('preferences.set',{role:'visitor',lang:'en'});assert.equal(L(select('homeBanner').title),'A new year with verified teachers');assert.deepEqual(select('featuredCourses').map(c=>c.id),['C-005','C-001']);
+ assert.ok(p6Render('/').html.includes('A new year with verified teachers'),'home renders banner');
+ dispatch('preferences.set',{role:'super_admin'});assert.ok(dispatch('cms.saveFaq',{index:'0',title_ar:'سؤال معدل للتجربة',title_en:'An edited demo question',body_ar:'إجابة معدلة للتجربة هنا.',body_en:'An edited demo answer here.'}).ok);
+ dispatch('preferences.set',{role:'visitor'});assert.equal(L(select('faqs',{})[0].title),'An edited demo question');
+ dispatch('preferences.set',{role:'super_admin'});const pr=dispatch('cms.savePage',{slug:'privacy',title_ar:'سياسة الخصوصية',title_en:'Privacy policy',body_ar:'نص توضيحي معدل غير معتمد.',body_en:'Edited illustrative text, not approved.'});assert.equal(pr.data.status,'draft');
+ assert.equal(dispatch('template.save',{templateId:'NT-001',subject_ar:'تم الدفع',subject_en:'Paid',body_ar:'تفعيل {course}',body_en:'Course {course} active',enabled:true}).fieldErrors.body_ar,'p8.placeholderMismatch');
+ assert.ok(dispatch('template.save',{templateId:'NT-001',subject_ar:'تم الدفع بنجاح',subject_en:'Payment confirmed',body_ar:'تم تفعيل {course} للطالب {student}.',body_en:'{course} is active for {student}.',enabled:'on'}).ok);
+ const n=audits().length;assert.equal(dispatch('support.resolveTicket',{ticketId:'ST-002',reason:''}).fieldErrors.reason,'p8.reasonRequired');assert.equal(audits().length,n);
+ assert.ok(dispatch('support.resolveTicket',{ticketId:'ST-002',reason:'Recording visibility explained'}).ok);
+ const e=audits().at(-1);assert.deepEqual([e.action,e.resource_type,e.resource_id,e.reason,e.after_summary],['support.resolve','support_ticket','ST-002','Recording visibility explained','resolved']);
+ const before=getState().delivery_attempts.find(a=>a.id==='DA-010'),note=getState().notifications.find(x=>x.id===before.notification_id),count=getState().notifications.length;
+ assert.equal(before.state,'failed');const r=dispatch('delivery.retry',{attemptId:'DA-010'});assert.ok(r.ok);assert.equal(r.data.eventId,note.event_id);
+ const after=getState().delivery_attempts.find(a=>a.id==='DA-010');assert.deepEqual([after.state,after.attempts,after.notification_id],['sent',before.attempts+1,before.notification_id]);
+ assert.equal(getState().notifications.length,count,'no duplicate notification');assert.ok(dispatch('delivery.retry',{attemptId:'DA-010'}).data.existing);
+ assert.equal(dispatch('roles.save',{assignmentId:'RA-007',permissions:['cms.edit'],reason:'Trim my scope'}).fieldErrors.permissions,'p8.ownerCoreControl');
+ assert.equal(dispatch('roles.save',{assignmentId:'RA-005',permissions:['finance.refund'],reason:'Trim',independentApproval:false}).errorKey,'p8.independentLocked');
+ assert.ok(dispatch('roles.save',{assignmentId:'RA-005',permissions:['finance.prepare_payout','finance.approve_payout','finance.refund'],reason:'Quarterly scope review'}).ok);
+ assert.equal(audits().at(-1).action,'role_assignment.update');
+ const ids=audits().map(x=>x.id);assert.equal(new Set(ids).size,ids.length,'append-only unique audit IDs');
+ assert.ok(dispatch('integration.test',{key:'payment'}).data.reference.startsWith('SIM-'));
+ dispatch('preferences.set',{role:'admin_finance'});assert.equal(select('admin.security',{}),null);
+ dispatch('preferences.set',{lang:'ar'});
+});
+check('P8a reports selector, CSV and academic edits keep history',()=>{
+ p8Reset('super_admin');const d=select('admin.reports',{from:'2026-08-01',to:'2026-10-19'});
+ assert.ok(d.weekly.length>0&&d.weekly.every(w=>Number.isInteger(w.enrollments)&&Number.isInteger(w.completions)));
+ assert.equal(Object.values(d.catalog).reduce((a,b)=>a+b,0),24);
+ const g4=select('admin.reports',{grade:'4'});assert.ok(g4.totals.courses===2);
+ const csv=adminViews.reportCsv(d);assert.ok(csv.startsWith('﻿')&&csv.split('\r\n').length>5&&!/undefined|NaN/.test(csv));
+ assert.ok(dispatch('academics.saveVersion',{curriculum_id:'CUR-001',name_ar:'إصدار ٢٠٢٧',name_en:'2027 edition',effective_year:'2027'}).ok);
+ assert.equal(getState().curriculum_versions.length,3);assert.equal(getState().curriculum_versions.at(-1).active,false);
+ assert.equal(dispatch('academics.setActive',{kind:'version',id:'CV-001',active:false}).errorKey,'p8.inUsePublished');
+ assert.ok(dispatch('academics.updateGrade',{id:'4',name_ar:'الصف الرابع الأساسي',name_en:'Grade 4 (basic)',cycle_ar:'الحلقة الأولى',cycle_en:'Cycle 1'}).ok);
+ assert.equal(dispatch('academics.deleteGrade',{id:'4'}).errorKey,'p8.gradeReferenced');assert.equal(getState().grades.length,12);
+ assert.ok(dispatch('academics.saveYear',{name_ar:'٢٠٢٧–٢٠٢٨',name_en:'2027–2028',starts:'2027-09-01',ends:'2028-07-31'}).ok);
+ assert.ok(select('admin.academics').history.some(e=>e.action==='grade.update'&&e.before_summary.includes('Grade 4')));
+});
+let p8Renders=0;
+dictionary.unknown={ar:'MISSING_DICTIONARY_KEY',en:'MISSING_DICTIONARY_KEY'};
+const p8Clean=html=>{assert.ok(html.length>0);assert.doesNotMatch(html,/undefined|NaN|\[object Object\]|MISSING_DICTIONARY_KEY/);assert.doesNotMatch(html.replace(/<[^>]+>/g,' '),/\b(?:p2|p3|p4|p5|p6|p7|p8|error|status|route)\.[\w./:-]+/);};
+const P8_CASES=[['/admin'],['/admin/people/students'],['/admin/people/students',{},'q=S-00&grade=4'],['/admin/people/students',{},'record=S-001'],['/admin/people/students',{},'record=S-999'],['/admin/people/guardian-links'],['/admin/people/guardian-links',{},'record=GL-003'],['/admin/people/guardian-links',{},'state=revoked&record=GL-004'],
+ ['/admin/people/teachers',{},'record=T-001'],['/admin/people/teachers',{},'tab=applications&record=TA-004'],['/admin/people/teachers',{},'tab=applications&record=TA-005'],['/admin/people/teachers',{},'tab=invitations&record=new'],['/admin/people/employees'],['/admin/people/employees',{},'record=RA-006'],['/admin/people/employees',{},'record=RA-007'],['/admin/people/employees',{},'record=new'],
+ ['/admin/people/teams'],['/admin/people/teams',{},'record=TM-001'],['/admin/academics/curricula',{},'record=CUR-001'],['/admin/academics/curricula',{},'tab=versions&record=new'],['/admin/academics/curricula',{},'tab=tracks&record=TR-002'],['/admin/academics/grades'],['/admin/academics/grades',{},'record=4'],['/admin/academics/subjects',{},'record=math'],['/admin/academics/subjects',{},'tab=mappings&version=CV-002'],
+ ['/admin/academics/periods',{},'record=AY-001'],['/admin/academics/periods',{},'tab=semesters&record=new'],['/admin/academics/translations'],['/admin/academics/translations',{},'grade=12'],['/admin/courses/review'],['/admin/courses/review',{},'record=C-012'],['/admin/courses/catalog',{},'record=C-001'],['/admin/courses/catalog',{},'tab=unpublished&record=C-020'],['/admin/courses/catalog',{},'tab=draft&q=C-01'],
+ ['/admin/courses/reports'],['/admin/courses/reports',{},'record=SR-002'],['/admin/courses/access'],['/admin/courses/access',{},'tab=grants&origin=admin_grant'],['/admin/courses/access',{},'tab=grants&record=new'],['/admin/courses/live'],['/admin/courses/live',{},'status=failed'],['/admin/courses/live',{},'record=LS-001'],
+ ['/admin/support/tickets',{},'record=ST-001'],['/admin/support/communications'],['/admin/support/communications',{},'record=SR-001'],['/admin/cms/home'],['/admin/cms/pages',{},'record=privacy'],['/admin/cms/pages',{},'tab=faqs&record=faq-0'],['/admin/cms/pages',{},'tab=faqs&record=faq-new'],['/admin/cms/promotions'],
+ ['/admin/notifications',{},'record=NT-001'],['/admin/notifications',{},'tab=delivery&state=failed'],['/admin/reports'],['/admin/reports',{},'grade=4&from=2026-09-01&to=2026-10-19'],['/admin/settings/roles'],['/admin/settings/roles',{},'record=RA-005'],['/admin/settings/roles',{},'record=RA-007'],['/admin/settings/security'],['/admin/settings/security',{},'tab=audit&action=course.approve'],['/admin/settings/integrations'],['/admin/settings/policies']];
+for(const r of P8_ROUTES)for(const tab of r.queryValues.tab??[])P8_CASES.push([r.path,{},'tab='+tab]);
+for(const lang of ['ar','en'])for(const role of ['admin_moderation','super_admin']){
+ p8Reset(role);dispatch('preferences.set',{lang});
+ const run=(list,tag='')=>{for(const [path,params={},query=''] of list)check(`P8a render ${role}/${lang}${tag} ${path} ${query}`,()=>{const before=getState(),{html,ctx}=p6Render(path,params,query);p8Renders++;assert.equal(getState(),before,'render is read-only');p8Clean(html);if(role==='admin_moderation'&&O_ONLY.includes(path)){assert.equal(html,fallback('resourceDenied',ctx),path);return;}
+  const rec=new URLSearchParams(query).get('record');if(rec){assert.ok(html.includes('id="record-drawer"'),'record drawer');assert.equal(html.includes(esc(t('p8.missingRecord'))),rec==='S-999','missing-record state only for unknown IDs');}});};
+ run(P8_CASES);
+ // Mutated branches: revealed sensitive records, decided items, field errors and resolved tickets.
+ for(const [type,id] of [['student','S-001'],['guardian_link','GL-003'],['ticket','ST-001'],['safety_report','SR-001'],['message','MSG-021']])dispatch('admin.sensitiveRead',{type,id,reason:'Render smoke review'});
+ dispatch('admin.saveForm',{name:'app:TA-004',values:{feedback:'x'},fieldErrors:{feedback:'error.messageShort'}});dispatch('admin.saveForm',{name:'translations:4',values:{s_math_en:''},fieldErrors:{s_math_en:'p8.labelMissing'}});
+ dispatch('guardianLink.decide',{linkId:'GL-003',decision:'verify',reason:'Render smoke'});dispatch('support.resolveTicket',{ticketId:'ST-002',reason:'Render smoke'});dispatch('application.review',{applicationId:'TA-004',decision:'requestInfo',feedback:'Please attach your licence.'});
+ dispatch('safety.setState',{reportId:'SR-001',state:'escalated',reason:'Render smoke'});dispatch('message.moderate',{messageId:'MSG-021',decision:'remove',reason:'Render smoke'});dispatch('live.addIncident',{sessionId:'LS-001',note:'<img src=x onerror=alert(1)> latency'});
+ dispatch('integration.test',{key:'live'});dispatch('delivery.retry',{attemptId:'DA-010'});
+ run([['/admin'],['/admin/people/students',{},'record=S-001'],['/admin/people/guardian-links',{},'state=verified&record=GL-003'],['/admin/people/teachers',{},'tab=applications&record=TA-004'],['/admin/support/tickets',{},'record=ST-001'],['/admin/support/tickets',{},'record=ST-002'],['/admin/support/tickets',{},'tab=flags'],['/admin/support/tickets',{},'tab=moderation'],['/admin/support/communications',{},'record=SR-001'],['/admin/courses/live',{},'record=LS-001'],['/admin/academics/translations'],['/admin/settings/integrations'],['/admin/notifications',{},'tab=delivery'],['/admin/settings/security',{},'tab=audit']],' mutated');
+ check(`P8a render ${role}/${lang} escapes staff-entered text`,()=>{const {html}=p6Render('/admin/courses/live',{},'record=LS-001');assert.ok(html.includes('&lt;img src=x onerror=alert(1)&gt;'));assert.ok(!html.includes('<img src=x'));});
+ check(`P8a render ${role}/${lang} dashboard scope`,()=>{const {html}=p6Render('/admin');assert.equal(html.includes(esc(t('p8.financeTitle'))),role==='super_admin');assert.equal(html.includes(esc(t('p8.academicTitle'))),role==='super_admin');});
+}
+dictionary.unknown=unknownEntry;
+resetDemoData();dispatch('preferences.set',{role:'visitor',lang:'ar'});
+console.log(`P8a render smoke: ${p8Renders} renders`);
 
 console.log(`${passed} checks passed${process.exitCode ? ' (with failures above)' : ''}`);

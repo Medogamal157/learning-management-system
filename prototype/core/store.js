@@ -943,6 +943,15 @@ function postMessage(s,q,actor,body,internal) {
  const m={id:nextId(s.messages,'MSG'),conversation_id:q.id,author_user_id:actor.user_id,text:body,lang:s.preferences.lang,internal,moderation_state:'visible',created_at:DEMO_NOW,updated_at:DEMO_NOW};
  s.messages.push(m);if(!internal)q.last_message_at=DEMO_NOW;q.updated_at=DEMO_NOW;return m;
 }
+// Membership revocation shared by the owner (team.revoke) and staff oversight (team.adminRevoke). With courseIds,
+// only those course assignments (and their conversation assignments) end; otherwise the whole membership does.
+function revokeTeamMember(s,m,courseIds=null) {
+ const owned=new Set(s.courses.filter(c=>c.owner_teacher_id===m.teacher_id).map(c=>c.id)),ids=courseIds?new Set([...courseIds].filter(id=>owned.has(id))):owned;
+ if(!courseIds)Object.assign(m,{status:'deactivated',updated_at:DEMO_NOW});
+ for(const a of s.course_team_assignments.filter(x=>x.team_member_id===m.id&&x.status==='active'&&ids.has(x.course_id)))Object.assign(a,{status:'revoked',updated_at:DEMO_NOW});
+ for(const a of s.conversation_assignments.filter(x=>x.assignee_user_id===m.user_id&&x.status==='active'&&ids.has(s.conversations.find(q=>q.id===x.conversation_id)?.course_id)))Object.assign(a,{status:'revoked',updated_at:DEMO_NOW});
+ for(const q of s.conversations.filter(x=>ids.has(x.course_id)&&x.assigned_user_id===m.user_id))Object.assign(q,{assigned_user_id:null,state:q.state==='resolved'?'resolved':'open',updated_at:DEMO_NOW});
+}
 function teamMember(s,actor,memberId) { const teacher=teacherOf(s,actor);if(!teacher)return {error:'p6.teacherOnly'};const m=s.teacher_team_members.find(x=>x.id===memberId);if(!m)return {error:'missing'};return m.teacher_id===teacher.id?{teacher,member:m}:{error:'resourceDenied'}; }
 const ownedIds=(s,teacher)=>new Set(s.courses.filter(c=>c.owner_teacher_id===teacher.id).map(c=>c.id));
 const courseTitleOf=(s,id)=>editView(s.courses.find(c=>c.id===id)).title;
@@ -1399,10 +1408,7 @@ Object.assign(reducers,{
  'team.revoke':(s,p,{actor})=>{
   const g=teamMember(s,actor,p.memberId);if(g.error)return fail(g.error);const m=g.member;
   if(!['active','invited'].includes(m.status))return ok({memberId:m.id,existing:true});
-  const before=m.status,ids=ownedIds(s,g.teacher);Object.assign(m,{status:'deactivated',updated_at:DEMO_NOW});
-  for(const a of s.course_team_assignments.filter(x=>x.team_member_id===m.id&&x.status==='active'))Object.assign(a,{status:'revoked',updated_at:DEMO_NOW});
-  for(const a of s.conversation_assignments.filter(x=>x.assignee_user_id===m.user_id&&x.status==='active'&&ids.has(s.conversations.find(q=>q.id===x.conversation_id)?.course_id)))Object.assign(a,{status:'revoked',updated_at:DEMO_NOW});
-  for(const q of s.conversations.filter(x=>ids.has(x.course_id)&&x.assigned_user_id===m.user_id))Object.assign(q,{assigned_user_id:null,state:q.state==='resolved'?'resolved':'open',updated_at:DEMO_NOW});
+  const before=m.status;revokeTeamMember(s,m);
   audit(s,actor,'team.revoke','teacher_team_member',m.id,before,'deactivated');return ok({memberId:m.id,existing:false});
  },
  // Destination changes are requests only: finance verifies before anything changes; only a masked tail is kept.
@@ -1537,5 +1543,697 @@ Object.assign(reducers,{
  'assistant.updateSettings':(s,p,{actor})=>{
   if(s.preferences.role!=='assistant')return fail('resourceDenied');const user=s.users.find(u=>u.id===actor.user_id);if(!user)return fail('missing');
   user.notification_prefs=Object.fromEntries(ASSISTANT_PREFS.map(k=>[k,p.prefs?.[k]===true||p.prefs?.[k]==='on']));user.updated_at=DEMO_NOW;return ok({...user.notification_prefs});
+ },
+});
+
+// ---- P8a administration (all modules except finance). Each selector and reducer re-derives the staff module
+// scope through can(): admin_moderation holds people (never employees), courses and support; super_admin holds
+// every module; admin_finance holds none of these. Sensitive reads (student profile, guardian evidence, support
+// threads, reported messages) require a typed reason, append an audit event and unlock only for this persona
+// session (transient state is cleared on every role switch).
+export const ADMIN_MODULES=['people','courses','support','academics','cms','notifications','reports','settings'];
+export const STAFF_ROLES=['admin_finance','admin_moderation','super_admin'];
+export const INVITE_ROLES=['admin_finance','admin_moderation'];
+export const STAFF_EXPIRY_DAYS=['30','90','365'];
+export const SENSITIVE_TYPES=Object.freeze({student:['people','students'],guardian_link:['people','guardian_student_links'],ticket:['support','support_tickets'],safety_report:['support','safety_reports'],message:['support','messages']});
+const staffCan=(can,module,type)=>can(module+'.manage',type?{module,type}:{module});
+const revealed=(s,type,id)=>!!s.transient.sensitive?.[type+':'+id];
+const reasonOf=v=>{ const value=text(v,600);return {value,error:!value?'p8.reasonRequired':value.length<5?'p8.reasonShort':null}; };
+const roleOfUser=(s,uid)=>s.role_assignments.find(r=>r.user_id===uid&&r.status!=='deactivated')?.role??null;
+const gradeOfCourse=(s,c)=>s.grades.find(g=>g.id===s.grade_subjects.find(x=>x.id===c.grade_subject_id)?.grade_id)??null;
+const isMessageReport=r=>!!(r.message_id||r.conversation_id);
+const RESOURCE_MODULE={teacher_application:'people',guardian_student_link:'people',student:'people',teacher:'people',teacher_invitation:'people',teacher_team_member:'people',user:'people',
+ course:'courses',access_grant:'courses',live_session:'courses',submission:'courses',task:'courses',
+ support_ticket:'support',safety_report:'support',message:'support',conversation:'support',
+ curriculum:'academics',curriculum_version:'academics',track:'academics',grade:'academics',subject:'academics',grade_subject:'academics',academic_year:'academics',semester:'academics',translation:'academics',
+ cms_page:'cms',notification_template:'notifications',delivery_attempt:'notifications',role_assignment:'settings',security:'settings',integration:'settings'};
+const ACADEMIC_TYPES=['curriculum','curriculum_version','track','grade','subject','grade_subject','academic_year','semester','translation'];
+const ENUM_LINK=['requested','pending_verification','verified','rejected','revoked'];
+const L2=v=>v&&typeof v==='object'?`${v.ar??''} ${v.en??''}`:String(v??'');
+const auditRow=s=>e=>({...e,actor:userName(s,e.actor_user_id)});
+const byNewest=(a,b)=>b.created_at.localeCompare(a.created_at)||b.id.localeCompare(a.id);
+const auditFor=(s,match)=>s.audit_events.filter(match).sort(byNewest).map(auditRow(s));
+function financeSummary(s) {
+ const per=s.teachers.map(x=>teacherLedger(s,x.id)),sum=k=>per.reduce((n,l)=>n+l[k],0);
+ return {gross:sum('gross'),commission:sum('commission'),payables:sum('pending')+sum('available')+sum('reserved')+sum('in_payout'),paid:sum('paid'),refunds:s.refunds.filter(r=>r.state==='succeeded').reduce((n,r)=>n+r.amount_baisa,0),openRefunds:s.refunds.filter(r=>!['succeeded','rejected','failed'].includes(r.state)).length};
+}
+function adminCourse(s,c) {
+ const card=teacherCourseCard(s,c),revision=c.status==='Published'&&c.pending_revision?.status==='Submitted';
+ return {...card,raw_status:c.status,kind:revision?'revision':'new',owner:s.teachers.find(x=>x.id===c.owner_teacher_id)?.name??null,
+  submitted_at:revision?c.pending_revision.submitted_at??c.pending_revision.updated_at:s.audit_events.filter(e=>e.resource_type==='course'&&e.resource_id===c.id&&e.action==='course.submit').map(e=>e.created_at).sort().at(-1)??c.updated_at,
+  restriction:c.content_restriction??null,enrolled:s.enrollments.filter(e=>e.course_id===c.id).length};
+}
+const invitationState=x=>x.status==='invited'&&x.expires_at<=DEMO_NOW?'expired':x.status;
+const notePerson=(s,uid,{event,type,title,body,href=null,courseId=null})=>notifyUser(s,uid,{event,type,title,body,href,courseId});
+const courseName=(s,id)=>{ const c=s.courses.find(x=>x.id===id);return c?editView(c).title:null; };
+registerSelectors({
+ 'admin.form':(s,{name})=>s.transient.adminForms?.[name]??{values:{},fieldErrors:{}},
+ 'admin.scope':(s,_a,{can})=>Object.fromEntries([...ADMIN_MODULES.map(m=>[m,staffCan(can,m)]),['employees',staffCan(can,'people','employees')],['finance',can('finance.read',{module:'finance'})]]),
+ 'admin.dashboard':(s,_a,{can,actor})=>{
+  if(!staffCan(can,'people')||!staffCan(can,'courses'))return null;
+  const queues={applications:s.teacher_applications.filter(a=>['submitted','under_review'].includes(a.state)).length,
+   guardianLinks:s.guardian_student_links.filter(l=>['requested','pending_verification'].includes(l.state)||l.scope_request?.state==='pending_verification').length,
+   courseReview:s.courses.filter(c=>c.status==='Submitted'||c.pending_revision?.status==='Submitted').length,
+   unpublishRequests:s.courses.filter(c=>c.unpublish_request?.state==='requested'&&c.status==='Published').length,
+   contentReports:s.safety_reports.filter(r=>!isMessageReport(r)&&r.state!=='resolved').length,
+   communications:s.safety_reports.filter(r=>isMessageReport(r)&&r.state!=='resolved').length,
+   flagged:s.messages.filter(m=>m.moderation_state==='flagged').length,
+   tickets:s.support_tickets.filter(x=>x.state!=='resolved').length,
+   liveIssues:s.live_sessions.filter(x=>x.status==='failed').length};
+  const academic=staffCan(can,'academics')?{curricula:s.curricula.filter(x=>x.active).length,versions:s.curriculum_versions.filter(x=>x.active).length,subjects:s.subjects.length,mappings:s.grade_subjects.filter(x=>x.active).length,grades:s.grades.length,teachers:s.teachers.filter(x=>x.application_status==='approved'&&x.account_status==='active').length,courses:Object.fromEntries(COURSE_STATES.map(k=>[k,s.courses.filter(c=>c.status===k).length]))}:null;
+  const finance=can('finance.read',{module:'finance'})?financeSummary(s):null;
+  const mods=new Set(ADMIN_MODULES.filter(m=>staffCan(can,m)));
+  const pending=[...s.teacher_applications.filter(a=>['submitted','under_review'].includes(a.state)).map(a=>({kind:'application',id:a.id,title:s.teachers.find(x=>x.id===a.teacher_id).name,state:a.state,domain:'teacher_application',href:'#/admin/people/teachers?tab=applications&record='+a.id})),
+   ...s.guardian_student_links.filter(l=>['requested','pending_verification'].includes(l.state)).map(l=>({kind:'guardian',id:l.id,title:s.guardians.find(g=>g.id===l.guardian_id).name,state:l.state,domain:'guardian_link',href:'#/admin/people/guardian-links?record='+l.id})),
+   ...s.courses.filter(c=>c.status==='Submitted'||c.pending_revision?.status==='Submitted').map(c=>({kind:'course',id:c.id,title:editView(c).title,state:'Submitted',domain:'course',href:'#/admin/courses/review?record='+c.id}))];
+  return {actor,queues,academic,finance,pending,activity:auditFor(s,e=>mods.has(RESOURCE_MODULE[e.resource_type])).slice(0,6)};
+ },
+ // People
+ 'admin.students':(s,{q='',grade='',status=''},{can})=>{
+  if(!staffCan(can,'people'))return null;const needle=String(q??'').trim().toLowerCase();
+  const rows=s.students.map(st=>{const u=s.users.find(x=>x.id===st.user_id);return {id:st.id,user_id:u.id,name:st.name,grade:s.grades.find(g=>g.id===st.current_grade_id)??null,status:u.status,courses:studentCourses(s,st.id).filter(r=>r.access.state==='active').length,links:s.guardian_student_links.filter(l=>l.student_id===st.id&&l.state==='verified').length};});
+  return {rows:rows.filter(r=>(!needle||[r.id,r.name.ar,r.name.en].some(x=>x.toLowerCase().includes(needle)))&&(!grade||r.grade?.id===grade)&&(!status||r.status===status)),total:rows.length};
+ },
+ 'admin.student':(s,{id},{can})=>{
+  if(!staffCan(can,'people'))return {status:'denied'};const st=s.students.find(x=>x.id===id);if(!st)return {status:'missing'};
+  const u=s.users.find(x=>x.id===st.user_id),base={id:st.id,user_id:u.id,name:st.name,grade:s.grades.find(g=>g.id===st.current_grade_id)??null,status:u.status};
+  const history=auditFor(s,e=>(e.resource_type==='student'&&e.resource_id===st.id)||e.resource_id===u.id);
+  if(!revealed(s,'student',id))return {status:'ok',locked:true,student:base,history};
+  return {status:'ok',locked:false,history,student:{...base,email:u.email,locale:u.locale,interests:st.interests.map(x=>s.subjects.find(y=>y.id===x)?.name).filter(Boolean)},
+   courses:studentCourses(s,st.id).map(r=>({id:r.course.id,title:r.course.title,status:r.status,access:r.access.state,origin:r.access.grant?.origin??null,percent:r.percent,enrollment:r.enrollment?.status??null})),
+   guardians:s.guardian_student_links.filter(l=>l.student_id===st.id).map(l=>({id:l.id,state:l.state,relationship:l.relationship,guardian:s.guardians.find(g=>g.id===l.guardian_id)?.name??null,scopes:[...l.scopes]})),
+   tickets:s.support_tickets.filter(x=>x.requester_user_id===u.id).map(x=>({id:x.id,subject:x.subject,state:x.state}))};
+ },
+ 'admin.guardianLinks':(s,{state=''},{can})=>{
+  if(!staffCan(can,'people'))return null;
+  const rows=s.guardian_student_links.map(l=>({id:l.id,state:l.state,guardian:s.guardians.find(g=>g.id===l.guardian_id)?.name??null,student_id:l.student_id,relationship:l.relationship,requested_at:l.requested_at,verified_at:l.verified_at,scopes:[...l.scopes],scope_request:l.scope_request??null})).sort((a,b)=>b.requested_at.localeCompare(a.requested_at)||a.id.localeCompare(b.id));
+  const queue=r=>['requested','pending_verification'].includes(r.state)||r.scope_request?.state==='pending_verification';
+  return {rows:!state||state==='queue'?rows.filter(queue):rows.filter(r=>r.state===state),counts:{queue:rows.filter(queue).length,...Object.fromEntries(ENUM_LINK.map(k=>[k,rows.filter(r=>r.state===k).length]))}};
+ },
+ 'admin.guardianLink':(s,{id},{can})=>{
+  if(!staffCan(can,'people'))return {status:'denied'};const l=s.guardian_student_links.find(x=>x.id===id);if(!l)return {status:'missing'};
+  const guardian=s.guardians.find(g=>g.id===l.guardian_id),st=s.students.find(x=>x.id===l.student_id);
+  const link={id:l.id,state:l.state,guardian:guardian?.name??null,relationship:l.relationship,requested_at:l.requested_at,verified_at:l.verified_at,revoked_at:l.revoked_at,verified_by:userName(s,l.verified_by),scopes:[...l.scopes],scope_request:l.scope_request??null,student_id:l.student_id};
+  const history=auditFor(s,e=>e.resource_type==='guardian_student_link'&&e.resource_id===l.id);
+  if(!revealed(s,'guardian_link',id))return {status:'ok',locked:true,link,history};
+  // Synthetic evidence fixture only: invitation token, consent flag, relationship declaration and learner match.
+  return {status:'ok',locked:false,link,history,evidence:{ref:l.evidence_ref,token:'OMAN-'+l.student_id.replace('-',''),consent:true,match:!!st,guardian_email:s.users.find(u=>u.id===guardian?.user_id)?.email??'',student:st?{id:st.id,name:st.name,grade:s.grades.find(g=>g.id===st.current_grade_id)?.name??null}:null}};
+ },
+ 'admin.teachers':(s,{q=''},{can})=>{
+  if(!staffCan(can,'people'))return null;const needle=String(q??'').trim().toLowerCase();
+  const teachers=s.teachers.map(x=>({id:x.id,name:x.name,email:s.users.find(u=>u.id===x.user_id)?.email??'',application_status:x.application_status,account_status:x.account_status,verification_state:x.verification_state,owned:s.courses.filter(c=>c.owner_teacher_id===x.id).length,published:s.courses.filter(c=>c.owner_teacher_id===x.id&&isPublic(s,c)).length,qualifications:qualifiedPairs(s,x.id).size})).filter(r=>!needle||[r.id,r.name.ar,r.name.en,r.email].some(v=>v.toLowerCase().includes(needle)));
+  const order=['submitted','under_review','more_info_required','draft_application','approved','rejected'];
+  const applications=s.teacher_applications.map(a=>({id:a.id,teacher_id:a.teacher_id,name:s.teachers.find(x=>x.id===a.teacher_id)?.name??null,state:a.state,pairs:a.declared_grade_subject_ids.length,updated_at:a.updated_at,reviewer:userName(s,a.reviewer_id)})).sort((a,b)=>order.indexOf(a.state)-order.indexOf(b.state)||a.id.localeCompare(b.id));
+  const invitations=s.teacher_invitations.map(x=>({...x,state:invitationState(x),inviter:userName(s,x.invited_by),teacher:x.teacher_id?s.teachers.find(t=>t.id===x.teacher_id)?.name??null:null})).sort(byNewest);
+  return {teachers,applications,invitations};
+ },
+ 'admin.application':(s,{id},{can})=>{
+  if(!staffCan(can,'people'))return {status:'denied'};const a=s.teacher_applications.find(x=>x.id===id);if(!a)return {status:'missing'};
+  const x=s.teachers.find(t=>t.id===a.teacher_id);
+  const pairs=a.declared_grade_subject_ids.map(gid=>{const gs=s.grade_subjects.find(g=>g.id===gid);return gs?{id:gid,grade:s.grades.find(g=>g.id===gs.grade_id),display_name:gs.display_name,active:gs.active,verified:s.teacher_grade_subjects.some(q=>q.teacher_id===x.id&&q.grade_subject_id===gid&&q.verification_state==='verified')}:null;}).filter(Boolean);
+  return {status:'ok',application:{...a,history:a.history.map(h=>({...h,actor:userName(s,h.actor_id)}))},teacher:{id:x.id,name:x.name,bio:x.bio,credentials:x.credentials,verification_state:x.verification_state,account_status:x.account_status,application_status:x.application_status},
+   files:a.credential_files??[],pairs,decidable:['submitted','under_review'].includes(a.state),history:auditFor(s,e=>e.resource_type==='teacher_application'&&e.resource_id===a.id)};
+ },
+ 'admin.teacher':(s,{id},{can})=>{
+  if(!staffCan(can,'people'))return {status:'denied'};const x=s.teachers.find(t=>t.id===id);if(!x)return {status:'missing'};
+  return {status:'ok',teacher:{...x,email:s.users.find(u=>u.id===x.user_id)?.email??''},qualifications:qualificationLabels(x.id),courses:s.courses.filter(c=>c.owner_teacher_id===x.id).map(c=>({id:c.id,title:editView(c).title,status:c.status})),
+   history:auditFor(s,e=>(e.resource_type==='teacher'&&e.resource_id===x.id)||(e.resource_type==='teacher_application'&&s.teacher_applications.some(a=>a.id===e.resource_id&&a.teacher_id===x.id)))};
+ },
+ 'admin.employees':(s,_a,{can,actor})=>{
+  if(!staffCan(can,'people','employees'))return null;
+  return {rows:s.role_assignments.filter(r=>STAFF_ROLES.includes(r.role)).map(r=>{const u=s.users.find(x=>x.id===r.user_id);return {id:r.id,user_id:r.user_id,name:u?.name??null,email:u?.email??'',role:r.role,status:r.status,effective_at:r.effective_at,expires_at:r.expires_at,permissions:r.permissions.length,own:r.user_id===actor.user_id,mfa:u?.mfa_state??'enrolled'};}),
+   history:auditFor(s,e=>e.resource_type==='role_assignment')};
+ },
+ 'admin.teams':(s,{q=''},{can})=>{
+  if(!staffCan(can,'people'))return null;const needle=String(q??'').trim().toLowerCase();
+  return {rows:s.teacher_team_members.map(m=>({id:m.id,teacher_id:m.teacher_id,teacher:s.teachers.find(x=>x.id===m.teacher_id)?.name??null,member:userName(s,m.user_id),email:s.users.find(u=>u.id===m.user_id)?.email??'',status:m.status,team_role:m.team_role,invited_at:m.invited_at,expires_at:m.expires_at,
+   assignments:s.course_team_assignments.filter(a=>a.team_member_id===m.id).map(a=>({id:a.id,course_id:a.course_id,title:courseName(s,a.course_id),capabilities:[...a.capabilities],status:a.status})),
+   conversations:s.conversation_assignments.filter(a=>a.assignee_user_id===m.user_id&&a.status==='active').length,
+   history:auditFor(s,e=>e.resource_type==='teacher_team_member'&&e.resource_id===m.id)})).filter(r=>!needle||[r.id,L2(r.teacher),L2(r.member),r.email].some(v=>v.toLowerCase().includes(needle)))};
+ },
+ // Academics (super_admin only)
+ 'admin.academics':(s,_a,{can})=>{
+  if(!staffCan(can,'academics'))return null;
+  return {curricula:s.curricula.map(c=>({...c,versions:s.curriculum_versions.filter(v=>v.curriculum_id===c.id).length})),
+   versions:s.curriculum_versions.map(v=>({...v,curriculum:s.curricula.find(c=>c.id===v.curriculum_id)?.name??null,mappings:s.grade_subjects.filter(g=>g.curriculum_version_id===v.id).length,tracks:s.tracks.filter(t=>t.curriculum_version_id===v.id).length})).sort((a,b)=>b.effective_year-a.effective_year||a.id.localeCompare(b.id)),
+   tracks:s.tracks.map(t=>({...t,version:s.curriculum_versions.find(v=>v.id===t.curriculum_version_id)?.name??null,courses:s.courses.filter(c=>c.track_id===t.id).length})),
+   grades:s.grades.map(g=>({...g,mappings:s.grade_subjects.filter(x=>x.grade_id===g.id).length,students:s.students.filter(x=>x.current_grade_id===g.id).length,courses:s.courses.filter(c=>gradeOfCourse(s,c)?.id===g.id).length})),
+   subjects:s.subjects.map(x=>({...x,mappings:s.grade_subjects.filter(g=>g.subject_id===x.id&&g.active).length,courses:s.courses.filter(c=>s.grade_subjects.find(g=>g.id===c.grade_subject_id)?.subject_id===x.id).length})),
+   mappings:s.grade_subjects.map(g=>({...g,courses:s.courses.filter(c=>c.grade_subject_id===g.id).length})),
+   years:s.academic_years.map(y=>({...y,semesters:s.semesters.filter(x=>x.academic_year_id===y.id).length,courses:s.courses.filter(c=>c.academic_year_id===y.id).length})),
+   semesters:s.semesters.map(x=>({...x,year:s.academic_years.find(y=>y.id===x.academic_year_id)?.name??null,courses:s.courses.filter(c=>c.semester_id===x.id).length})).sort((a,b)=>a.starts_at.localeCompare(b.starts_at)),
+   history:auditFor(s,e=>ACADEMIC_TYPES.includes(e.resource_type))};
+ },
+ // Course operations
+ 'admin.reviewQueue':(s,_a,{can})=>staffCan(can,'courses')?s.courses.filter(c=>c.status==='Submitted'||c.pending_revision?.status==='Submitted').map(c=>adminCourse(s,c)).sort((a,b)=>a.submitted_at.localeCompare(b.submitted_at)):null,
+ 'admin.course':(s,{id},{can})=>{
+  if(!staffCan(can,'courses'))return {status:'denied'};const c=s.courses.find(x=>x.id===id);if(!c)return {status:'missing'};
+  return {status:'ok',course:adminCourse(s,c),checklist:courseChecklist(s,c),qualified:qualifiedPairs(s,c.owner_teacher_id).has(editView(c).grade_subject_id),
+   revision:c.pending_revision?Object.entries(c.pending_revision.fields).map(([field,after])=>({field,before:c[field],after})):[],pending:c.pending_revision?{status:c.pending_revision.status,feedback:c.pending_revision.feedback}:null,
+   published:c.published_snapshot?{title:c.published_snapshot.title,summary:c.published_snapshot.summary}:null,unpublish_request:c.unpublish_request??null,
+   lessons:lessonsIn(s,c.id).length,modules:s.modules.filter(m=>m.course_id===c.id).length,previews:lessonsIn(s,c.id).filter(l=>l.preview).length,
+   reports:s.safety_reports.filter(r=>r.course_id===c.id&&!isMessageReport(r)).map(r=>({id:r.id,state:r.state,reason:r.reason})),
+   history:auditFor(s,e=>e.resource_type==='course'&&e.resource_id===c.id)};
+ },
+ 'admin.catalog':(s,{tab='published',q=''},{can})=>{
+  if(!staffCan(can,'courses'))return null;const needle=String(q??'').trim().toLowerCase();
+  const TAB={published:['Published'],draft:['Draft','Submitted','ChangesRequested'],archived:['Archived'],unpublished:['Unpublished']};
+  const all=s.courses.map(c=>adminCourse(s,c));
+  return {rows:all.filter(c=>(TAB[tab]??TAB.published).includes(c.raw_status)&&(!needle||[c.id,c.title.ar,c.title.en,L2(c.owner)].some(v=>v.toLowerCase().includes(needle)))),counts:Object.fromEntries(Object.entries(TAB).map(([k,v])=>[k,all.filter(c=>v.includes(c.raw_status)).length]))};
+ },
+ 'admin.contentReports':(s,{state=''},{can})=>{
+  if(!staffCan(can,'courses'))return null;
+  return {rows:s.safety_reports.filter(r=>!isMessageReport(r)&&(!state||r.state===state)).map(r=>{const c=s.courses.find(x=>x.id===r.course_id);return {id:r.id,state:r.state,reason:r.reason,course_id:r.course_id,course_title:c?editView(c).title:null,course_status:c?.status??null,restriction:c?.content_restriction?.report_id===r.id?c.content_restriction:null,reporter_role:roleOfUser(s,r.reporter_user_id),created_at:r.created_at,resolution:r.resolution??'',
+   history:auditFor(s,e=>(e.resource_type==='safety_report'&&e.resource_id===r.id)||(e.resource_type==='course'&&e.resource_id===r.course_id&&['course.unpublish','course.archive','course.republish','course.restrict'].includes(e.action)))};}).sort((a,b)=>(a.state==='resolved')-(b.state==='resolved')||b.created_at.localeCompare(a.created_at))};
+ },
+ 'admin.access':(s,{q='',origin='',status=''},{can})=>{
+  if(!staffCan(can,'courses'))return null;const needle=String(q??'').trim().toLowerCase();
+  const name=id=>s.students.find(x=>x.id===id)?.name;
+  const match=r=>!needle||[r.id,r.student_id,r.course_id,L2(name(r.student_id)),L2(courseName(s,r.course_id))].some(v=>v.toLowerCase().includes(needle));
+  const effective=g=>g.status==='active'&&g.ends_at<=DEMO_NOW?'expired':g.status;
+  return {enrollments:s.enrollments.filter(match).filter(e=>!status||e.status===status).map(e=>({...e,student:name(e.student_id),course_title:courseName(s,e.course_id),access:accessOf(s,e.student_id,e.course_id).state,grants:s.access_grants.filter(g=>g.enrollment_id===e.id).length})),
+   grants:s.access_grants.filter(match).filter(g=>(!origin||g.origin===origin)&&(!status||effective(g)===status)).map(g=>({...g,student:name(g.student_id),course_title:courseName(s,g.course_id),effective:effective(g),granted_by_name:userName(s,g.granted_by),revoked_by_name:userName(s,g.revoked_by)})),
+   students:s.students.map(x=>({id:x.id,name:x.name})),courses:s.courses.filter(c=>['Published','Unpublished','Archived'].includes(c.status)).map(c=>({id:c.id,title:editView(c).title,status:c.status}))};
+ },
+ 'admin.live':(s,{status=''},{can})=>{
+  if(!staffCan(can,'courses'))return null;
+  const GROUP={upcoming:['draft','scheduled','rescheduled'],live:['live'],ended:['ended','recording_processing','recording_ready','recording_published'],cancelled:['cancelled'],failed:['failed']};
+  const all=s.live_sessions.map(x=>({...x,course_title:courseName(s,x.course_id),host:s.teachers.find(t=>t.id===x.host_teacher_id)?.name??null,present:s.attendance.filter(a=>a.live_session_id===x.id&&a.status==='present').length,recording:s.recordings.find(r=>r.live_session_id===x.id)??null,incidents:(x.incident_notes??[]).map(n=>({...n,author:userName(s,n.author_user_id)}))})).sort((a,b)=>a.starts_at.localeCompare(b.starts_at));
+  return {rows:Object.hasOwn(GROUP,status)?all.filter(x=>GROUP[status].includes(x.status)):all,counts:Object.fromEntries(Object.entries(GROUP).map(([k,v])=>[k,all.filter(x=>v.includes(x.status)).length])),total:all.length};
+ },
+ // Support and safety
+ 'admin.tickets':(s,{state=''},{can})=>{
+  if(!staffCan(can,'support'))return null;
+  return {rows:s.support_tickets.filter(x=>!state||x.state===state).map(x=>({id:x.id,subject:x.subject,state:x.state,requester:userName(s,x.requester_user_id),requester_role:roleOfUser(s,x.requester_user_id),course_title:x.course_id?courseName(s,x.course_id):null,assignee:userName(s,x.assigned_staff_id),updated_at:x.updated_at,replies:(x.replies??[]).length})).sort((a,b)=>(a.state==='resolved')-(b.state==='resolved')||b.updated_at.localeCompare(a.updated_at))};
+ },
+ 'admin.ticket':(s,{id},{can})=>{
+  if(!staffCan(can,'support'))return {status:'denied'};const x=s.support_tickets.find(v=>v.id===id);if(!x)return {status:'missing'};
+  const ticket={id:x.id,subject:x.subject,state:x.state,requester:userName(s,x.requester_user_id),requester_role:roleOfUser(s,x.requester_user_id),assignee:userName(s,x.assigned_staff_id),created_at:x.created_at,updated_at:x.updated_at,resolution:x.resolution};
+  const history=auditFor(s,e=>e.resource_type==='support_ticket'&&e.resource_id===x.id);
+  if(!revealed(s,'ticket',id))return {status:'ok',locked:true,ticket,history};
+  return {status:'ok',locked:false,ticket:{...ticket,body:x.body,course_title:x.course_id?courseName(s,x.course_id):null},replies:(x.replies??[]).map(r=>({...r,author:userName(s,r.author_user_id),staff:STAFF_ROLES.includes(roleOfUser(s,r.author_user_id))})),history};
+ },
+ 'admin.flags':(s,_a,{can})=>{
+  if(!staffCan(can,'support'))return null;
+  const row=m=>{const q=s.conversations.find(x=>x.id===m.conversation_id),open=revealed(s,'message',m.id);return {id:m.id,state:m.moderation_state,conversation_id:m.conversation_id,course_title:q?courseName(s,q.course_id):null,author_role:roleOfUser(s,m.author_user_id),created_at:m.created_at,reports:s.safety_reports.filter(r=>r.message_id===m.id).length,open,text:open?m.text:null};};
+  return {flagged:s.messages.filter(m=>m.moderation_state==='flagged').map(row),removed:s.messages.filter(m=>m.moderation_state==='removed').map(row),log:auditFor(s,e=>['message','safety_report'].includes(e.resource_type))};
+ },
+ 'admin.communications':(s,{state=''},{can})=>{
+  if(!staffCan(can,'support'))return null;
+  return {rows:s.safety_reports.filter(r=>isMessageReport(r)&&(!state||r.state===state)).map(r=>({id:r.id,state:r.state,reason:r.reason,course_title:courseName(s,r.course_id),kind:r.message_id?'message':'conversation',reporter_role:roleOfUser(s,r.reporter_user_id),assignee:userName(s,r.assigned_staff_id),created_at:r.created_at})).sort((a,b)=>(a.state==='resolved')-(b.state==='resolved')||b.created_at.localeCompare(a.created_at))};
+ },
+ // Reported thread context only: the reported message and its immediate neighbours (or the latest messages of a
+ // reported thread), never internal notes and never another conversation.
+ 'admin.communication':(s,{id},{can})=>{
+  if(!staffCan(can,'support'))return {status:'denied'};const r=s.safety_reports.find(x=>x.id===id&&isMessageReport(x));if(!r)return {status:'missing'};
+  const m=s.messages.find(x=>x.id===r.message_id),q=s.conversations.find(x=>x.id===(r.conversation_id??m?.conversation_id));
+  const report={id:r.id,state:r.state,reason:r.reason,course_title:courseName(s,r.course_id),reporter_role:roleOfUser(s,r.reporter_user_id),created_at:r.created_at,kind:r.message_id?'message':'conversation',notes:(r.review_notes??[]).map(n=>({...n,author:userName(s,n.author_user_id)})),next:SAFETY_NEXT[r.state]??[]};
+  const history=auditFor(s,e=>e.resource_type==='safety_report'&&e.resource_id===r.id);
+  if(!revealed(s,'safety_report',id))return {status:'ok',locked:true,report,history};
+  const thread=q?s.messages.filter(x=>x.conversation_id===q.id&&!x.internal).sort((a,b)=>a.created_at.localeCompare(b.created_at)):[];
+  const at=m?thread.findIndex(x=>x.id===m.id):-1,window=at>=0?thread.slice(Math.max(0,at-2),at+3):thread.slice(-5);
+  return {status:'ok',locked:false,report:{...report,restricted_note:r.restricted_note},history,subject:q?.subject??null,messages:window.map(x=>({id:x.id,text:x.text,lang:x.lang,state:x.moderation_state,reported:x.id===r.message_id,author_role:roleOfUser(s,x.author_user_id),created_at:x.created_at}))};
+ },
+ // CMS, notifications, reports and settings (super_admin only)
+ 'admin.cms':(s,_a,{can})=>{
+  if(!staffCan(can,'cms'))return null;const home=s.cms_pages.find(p=>p.slug==='home');
+  return {pages:s.cms_pages.map(p=>({...p,policy:['privacy','terms','refunds'].includes(p.slug)})),banner:home?.sections.find(x=>x.kind==='banner')??null,featured:home?.sections.find(x=>x.kind==='featured')?.course_ids??[],
+   faqs:(s.cms_pages.find(p=>p.slug==='help')?.sections??[]).filter(x=>x.kind==='faq'),courses:s.courses.filter(c=>isPublic(s,c)).map(c=>publicView(c)),promotions:s.promotions,settings:s.platform_settings[0],
+   history:auditFor(s,e=>e.resource_type==='cms_page')};
+ },
+ 'admin.notifications':(s,{state='',channel=''},{can})=>{
+  if(!staffCan(can,'notifications'))return null;
+  const attempts=s.delivery_attempts.map(a=>{const n=s.notifications.find(x=>x.id===a.notification_id);return {...a,event_id:n?.event_id??'',type:n?.type??'',title:n?.title??null,recipient:userName(s,n?.recipient_user_id),recipient_role:roleOfUser(s,n?.recipient_user_id)};}).sort(byNewest);
+  return {templates:s.notification_templates,attempts:attempts.filter(a=>(!state||a.state===state)&&(!channel||a.channel===channel)),counts:Object.fromEntries(['queued','sent','failed','read'].map(k=>[k,attempts.filter(a=>a.state===k).length])),total:attempts.length};
+ },
+ 'admin.reports':(s,a,{can})=>{
+  if(!staffCan(can,'reports'))return null;
+  let from=datePart(a.from)??'2026-08-01',to=datePart(a.to)??DEMO_NOW.slice(0,10);if(from>to)[from,to]=[to,from];
+  const start=from+'T00:00:00Z',end=to+'T23:59:59Z',inRange=iso=>!!iso&&iso>=start&&iso<=end;
+  const grade=s.grades.some(g=>g.id===a.grade)?a.grade:'',courseId=s.courses.some(c=>c.id===a.course)?a.course:'';
+  const scoped=s.courses.filter(c=>(!grade||gradeOfCourse(s,c)?.id===grade)&&(!courseId||c.id===courseId)),ids=new Set(scoped.map(c=>c.id));
+  const enrollments=s.enrollments.filter(e=>ids.has(e.course_id)&&inRange(e.started_at));
+  const weeks=[];for(let t=Date.parse(start);t<=Date.parse(end);t+=7*DAY)weeks.push(new Date(t).toISOString().slice(0,10));
+  const weekly=weeks.slice(-12).map((w,i,list)=>{const s0=w+'T00:00:00Z',s1=list[i+1]?list[i+1]+'T00:00:00Z':end;return {week:w,enrollments:enrollments.filter(e=>e.started_at>=s0&&e.started_at<s1).length,completions:s.lesson_progress.filter(p=>p.status==='done'&&p.completed_at&&p.completed_at>=s0&&p.completed_at<s1&&ids.has(lessonCourse(s,s.lessons.find(l=>l.id===p.lesson_id)))).length};});
+  const learning=scoped.filter(c=>s.enrollments.some(e=>e.course_id===c.id)).map(c=>{const rows=learnerRows(s,new Set([c.id]));return {id:c.id,title:editView(c).title,learners:rows.length,active:rows.filter(r=>r.access==='active').length,average:rows.length?Math.round(rows.reduce((n,r)=>n+r.percent,0)/rows.length):0};});
+  const orders=s.orders.filter(o=>inRange(o.created_at)&&s.order_items.some(i=>i.order_id===o.id&&ids.has(i.course_id)));
+  const settled=orders.filter(o=>['paid','partially_refunded','refunded'].includes(o.state)).length,STATES=['open','assigned','waiting','resolved','escalated'];
+  return {filters:{from,to,grade,course:courseId},weekly,learning,catalog:Object.fromEntries(COURSE_STATES.map(k=>[k,scoped.filter(c=>c.status===k).length])),
+   conversion:{...Object.fromEntries(['draft','pending','paid','failed','cancelled','partially_refunded','refunded'].map(k=>[k,orders.filter(o=>o.state===k).length])),started:orders.length,settled,rate:orders.length?Math.round(settled*100/orders.length):0},
+   support:{tickets:Object.fromEntries(STATES.map(k=>[k,s.support_tickets.filter(x=>x.state===k&&inRange(x.created_at)).length])),reports:Object.fromEntries(STATES.map(k=>[k,s.safety_reports.filter(x=>x.state===k&&inRange(x.created_at)).length]))},
+   totals:{enrollments:enrollments.length,courses:scoped.length,published:scoped.filter(c=>c.status==='Published').length,completions:weekly.reduce((n,w)=>n+w.completions,0)},grades:s.grades,courses:s.courses.map(c=>({id:c.id,title:editView(c).title}))};
+ },
+ 'admin.roles':(s,_a,{can,actor})=>{
+  if(!staffCan(can,'settings'))return null;
+  const rows=s.role_assignments.map(r=>({...r,name:userName(s,r.user_id),own:r.user_id===actor.user_id,staff:STAFF_ROLES.includes(r.role)}));
+  return {rows,permissions:s.permissions,matrix:[...new Set(rows.map(r=>r.role))].map(role=>({role,permissions:[...new Set(rows.filter(r=>r.role===role&&r.status==='active').flatMap(r=>r.permissions))]})),history:auditFor(s,e=>e.resource_type==='role_assignment')};
+ },
+ 'admin.security':(s,{actor:who='',action='',type='',q=''},{can,actor})=>{
+  if(!staffCan(can,'settings'))return null;const needle=String(q??'').trim().toLowerCase();
+  const events=auditFor(s,()=>true);
+  return {staff:s.role_assignments.filter(r=>STAFF_ROLES.includes(r.role)).map(r=>{const u=s.users.find(x=>x.id===r.user_id);return {id:u.id,assignment_id:r.id,name:u.name,role:r.role,status:r.status,mfa:u.mfa_state??'enrolled',sessions_revoked_at:u.sessions_revoked_at??null,own:u.id===actor.user_id};}),
+   events:events.filter(e=>(!who||e.actor_user_id===who)&&(!action||e.action===action)&&(!type||e.resource_type===type)&&(!needle||[e.id,e.resource_id,e.reason,e.action].some(v=>String(v??'').toLowerCase().includes(needle)))),
+   facets:{actors:[...new Set(events.map(e=>e.actor_user_id))].map(id=>({id,name:userName(s,id)})),actions:[...new Set(events.map(e=>e.action))].sort(),types:[...new Set(events.map(e=>e.resource_type))].sort()},total:events.length};
+ },
+ 'admin.integrations':(s,_a,{can})=>{
+  if(!staffCan(can,'settings'))return null;const set=s.platform_settings[0];
+  return {rows:Object.entries(set.integration_statuses).map(([key,status])=>({key,status,last:set.integration_tests?.[key]??null})),history:auditFor(s,e=>e.resource_type==='integration')};
+ },
+ 'admin.policies':(s,_a,{can})=>staffCan(can,'settings')?{settings:s.platform_settings[0]}:null,
+});
+const APPLICATION_DECISIONS={approve:'approved',requestInfo:'more_info_required',reject:'rejected',startReview:'under_review'};
+const APPLICATION_AUDIT={approve:'approve',requestInfo:'request_info',reject:'reject',startReview:'start_review'};
+const COURSE_MODERATION={unpublish:{from:['Published'],to:'Unpublished'},archive:{from:['Published','Draft'],to:'Archived'},republish:{from:['Unpublished'],to:'Published'}};
+const SAFETY_NEXT={open:['assigned','escalated','resolved'],assigned:['waiting','escalated','resolved'],waiting:['assigned','resolved'],escalated:['assigned','resolved']};
+const datePart=v=>{ const m=/^(\d{4})-(\d{2})-(\d{2})$/.exec(String(v??''));if(!m)return null;const d=new Date(Date.UTC(+m[1],+m[2]-1,+m[3]));return d.getUTCDate()===+m[3]&&d.getUTCMonth()===+m[2]-1?m[0]:null; };
+const bilingual=(p,key,min,max)=>{ const r=pairText({ar:p[key+'_ar'],en:p[key+'_en']},min,max);return {value:r.value,errors:{[key+'_ar']:r.errors.ar,[key+'_en']:r.errors.en}}; };
+const placeholders=v=>[...new Set([...String(v).matchAll(/\{(\w+)\}/g)].map(m=>m[1]))].sort().join();
+const later=days=>new Date(Date.parse(DEMO_NOW)+days*DAY).toISOString().replace('.000Z','Z');
+function publishedDependants(s,kind,id) {
+ return s.courses.filter(c=>c.status==='Published').some(c=>{const gs=s.grade_subjects.find(g=>g.id===c.grade_subject_id),v=s.curriculum_versions.find(x=>x.id===gs?.curriculum_version_id);return kind==='curriculum'?v?.curriculum_id===id:kind==='version'?gs?.curriculum_version_id===id:c.track_id===id||gs?.track_id===id;});
+}
+// Shared create/update for academic records: edits keep the record (and every reference to it) and audit a
+// before/after summary (the history tab); creation appends a new record.
+function saveRecord(s,actor,{collection,prefix,type,id,values,summary,extra={}}) {
+ const existing=id?s[collection].find(x=>x.id===id):null;if(id&&!existing)return fail('missing');
+ if(existing){const before=summary(existing);Object.assign(existing,values,{updated_at:DEMO_NOW});audit(s,actor,type+'.update',type,existing.id,before,summary(existing));return ok({id:existing.id,created:false});}
+ const row={id:nextId(s[collection],prefix),...extra,...values,created_at:DEMO_NOW,updated_at:DEMO_NOW};s[collection].push(row);audit(s,actor,type+'.create',type,row.id,'',summary(row));return ok({id:row.id,created:true});
+}
+Object.assign(reducers,{
+ 'admin.saveForm':(s,p,{can})=>{
+  if(!ADMIN_MODULES.some(m=>staffCan(can,m))||typeof p.name!=='string'||!/^[\w:-]{1,60}$/.test(p.name))return fail('invalidAction');
+  const values=Object.fromEntries(Object.entries(p.values??{}).filter(([k,v])=>/^\w{1,40}$/.test(k)&&typeof v==='string').map(([k,v])=>[k,v.slice(0,4000)]));
+  const fieldErrors=Object.fromEntries(Object.entries(p.fieldErrors??{}).filter(([k,v])=>/^\w{1,40}$/.test(k)&&typeof v==='string'&&/^(?:error|p5|p6|p8)\.\w+$/.test(v)));
+  (s.transient.adminForms??={})[p.name]={values,fieldErrors};return ok(null);
+ },
+ 'admin.clearForm':(s,p)=>{ if(s.transient.adminForms&&typeof p.name==='string')delete s.transient.adminForms[p.name];return ok(null); },
+ 'admin.sensitiveRead':(s,p,{actor,can})=>{
+  const spec=Object.hasOwn(SENSITIVE_TYPES,p.type)?SENSITIVE_TYPES[p.type]:null;if(!spec)return fail('invalidAction');
+  if(!staffCan(can,spec[0]))return fail('resourceDenied');
+  const record=s[spec[1]].find(x=>x.id===p.id);if(!record)return fail('missing');
+  const r=reasonOf(p.reason);if(r.error)return failFields({reason:r.error});
+  if(revealed(s,p.type,p.id))return ok({type:p.type,id:record.id,existing:true});
+  (s.transient.sensitive??={})[p.type+':'+p.id]=true;
+  audit(s,actor,'support.sensitive_read',{ticket:'support_ticket',guardian_link:'guardian_student_link'}[p.type]??p.type,record.id,'','viewed',r.value);
+  return ok({type:p.type,id:record.id,existing:false});
+ },
+ 'people.setAccountStatus':(s,p,{actor,can})=>{
+  if(!staffCan(can,'people'))return fail('resourceDenied');
+  if(!['active','suspended'].includes(p.status))return fail('invalidAction');
+  const target=p.kind==='teacher'?s.teachers.find(v=>v.id===p.id):p.kind==='student'?s.students.find(v=>v.id===p.id):undefined;
+  if(target===undefined)return fail('invalidAction');if(!target)return fail('missing');
+  const r=reasonOf(p.reason);if(r.error)return failFields({reason:r.error});
+  // Account status is independent of the teacher application state.
+  const record=p.kind==='teacher'?target:s.users.find(v=>v.id===target.user_id),key=p.kind==='teacher'?'account_status':'status';
+  if(record[key]===p.status)return ok({id:target.id,existing:true});
+  const before=record[key];Object.assign(record,{[key]:p.status,updated_at:DEMO_NOW});audit(s,actor,p.kind+'.account_status',p.kind,target.id,before,p.status,r.value);return ok({id:target.id,status:p.status});
+ },
+ // Staff decisions on guardian links. Verification reuses guardianLink.verify; a reason is always required here.
+ 'guardianLink.decide':(s,p,ctx)=>{
+  const {actor,can}=ctx;if(!staffCan(can,'people'))return fail('resourceDenied');
+  const link=s.guardian_student_links.find(l=>l.id===p.linkId);if(!link)return fail('missing');
+  const r=reasonOf(p.reason);if(r.error)return failFields({reason:r.error});
+  const guardian=s.guardians.find(g=>g.id===link.guardian_id),note=(event,title)=>notePerson(s,guardian?.user_id,{event,type:'guardian_link',title,body:{ar:'راجع حالة الربط في صفحة أبنائي.',en:'Review the link status on My children.'},href:'#/guardian/children'});
+  if(p.decision==='verify')return reducers['guardianLink.verify'](s,{linkId:link.id,reason:r.value},ctx);
+  if(p.decision==='reject') {
+   if(!['requested','pending_verification'].includes(link.state))return fail('p5.invalidTransition');
+   const before=link.state;Object.assign(link,{state:'rejected',updated_at:DEMO_NOW});linkAudit(s,actor,link,'guardian_link.reject',before,'rejected',r.value);
+   note('guardian-link-rejected-'+link.id,{ar:'لم يُقبل طلب ربط الطالب',en:'Learner link request not approved'});return ok({linkId:link.id,state:'rejected'});
+  }
+  if(p.decision==='revoke') {
+   if(link.state!=='verified')return fail('p5.invalidTransition');
+   Object.assign(link,{state:'revoked',revoked_at:DEMO_NOW,scope_request:null,updated_at:DEMO_NOW});linkAudit(s,actor,link,'guardian_link.revoke','verified','revoked',r.value);
+   note('guardian-link-revoked-'+link.id,{ar:'أُلغي ربط طالب',en:'A learner link was revoked'});return ok({linkId:link.id,state:'revoked'});
+  }
+  if(p.decision==='approveScope'||p.decision==='rejectScope') {
+   if(link.state!=='verified'||link.scope_request?.state!=='pending_verification')return fail('p8.noScopeRequest');
+   const before=link.scopes.join(','),requested=link.scope_request.scopes;
+   if(p.decision==='approveScope')link.scopes=LINK_SCOPES.filter(k=>requested.includes(k));
+   Object.assign(link,{scope_request:null,updated_at:DEMO_NOW});
+   linkAudit(s,actor,link,p.decision==='approveScope'?'guardian_link.scope_approve':'guardian_link.scope_reject',before,link.scopes.join(','),r.value);
+   note(`guardian-scope-${p.decision}-${link.id}-${s.audit_events.length}`,p.decision==='approveScope'?{ar:'اعتُمد تعديل صلاحيات الربط',en:'Link permission change approved'}:{ar:'لم يُعتمد تعديل صلاحيات الربط',en:'Link permission change declined'});
+   return ok({linkId:link.id,scopes:[...link.scopes]});
+  }
+  return fail('invalidAction');
+ },
+ // Reviewer transitions (SPEC §3.1): submitted → under_review → approved/rejected/more_info_required. A decision on a
+ // submitted application records the implicit under_review step. Approval verifies the declared qualifications and
+ // credentials only — it never creates courses; account status stays a separate control.
+ 'application.review':(s,p,{actor,can})=>{
+  if(!staffCan(can,'people'))return fail('resourceDenied');
+  const a=s.teacher_applications.find(x=>x.id===p.applicationId);if(!a)return fail('missing');
+  const to=Object.hasOwn(APPLICATION_DECISIONS,p.decision)?APPLICATION_DECISIONS[p.decision]:null;if(!to)return fail('invalidAction');
+  if(!['submitted','under_review'].includes(a.state)||(p.decision==='startReview'&&a.state!=='submitted'))return fail('p8.applicationNotPending');
+  const feedback=text(p.feedback,1000);
+  if(['requestInfo','reject'].includes(p.decision)){const error=feedback&&feedback.length<10?'error.messageShort':lengthError(feedback,10);if(error)return failFields({feedback:error});}
+  if(p.decision==='approve'&&a.declared_grade_subject_ids.some(id=>!s.grade_subjects.some(g=>g.id===id&&g.active)))return fail('p8.pairsInactive');
+  const teacher=s.teachers.find(x=>x.id===a.teacher_id),before=a.state;
+  if(a.state==='submitted'&&p.decision!=='startReview')a.history.push({state:'under_review',actor_id:actor.user_id,at:DEMO_NOW});
+  a.history.push({state:to,actor_id:actor.user_id,at:DEMO_NOW});
+  Object.assign(a,{state:to,reviewer_id:actor.user_id,updated_at:DEMO_NOW});
+  if(p.decision!=='startReview')a.feedback=feedback?typed(feedback):p.decision==='approve'?{ar:'تم التحقق من المؤهلات التجريبية.',en:'Synthetic credentials verified.'}:a.feedback;
+  Object.assign(teacher,{application_status:to,updated_at:DEMO_NOW});
+  if(p.decision==='approve') {
+   Object.assign(teacher,{verification_state:'verified',credentials:teacher.credentials.map(c=>({...c,verified:true}))});
+   for(const gid of a.declared_grade_subject_ids){const held=s.teacher_grade_subjects.find(q=>q.teacher_id===teacher.id&&q.grade_subject_id===gid);if(held)Object.assign(held,{verification_state:'verified',updated_at:DEMO_NOW});else s.teacher_grade_subjects.push({id:nextId(s.teacher_grade_subjects,'TGS'),teacher_id:teacher.id,grade_subject_id:gid,verification_state:'verified',created_at:DEMO_NOW,updated_at:DEMO_NOW});}
+  }
+  if(p.decision==='reject')teacher.verification_state='rejected';
+  audit(s,actor,'teacher_application.'+APPLICATION_AUDIT[p.decision],'teacher_application',a.id,before,to,feedback);
+  if(p.decision!=='startReview')notePerson(s,teacher.user_id,{event:`application-${a.id}-${a.history.length}`,type:'application',title:{approve:{ar:'تم اعتماد طلب التدريس',en:'Teaching application approved'},requestInfo:{ar:'مطلوب معلومات إضافية لطلبك',en:'More information needed for your application'},reject:{ar:'لم يُقبل طلب التدريس',en:'Teaching application not approved'}}[p.decision],body:structuredClone(a.feedback),href:'#/auth/teacher-application?step=review'});
+  return ok({id:a.id,state:to});
+ },
+ 'people.inviteTeacher':(s,p,{actor,can})=>{
+  if(!staffCan(can,'people'))return fail('resourceDenied');
+  const email=text(p.email,120).toLowerCase(),days=INVITE_DAYS.includes(String(p.days))?Number(p.days):null;
+  const errors=pick({email:!email?'error.required':!EMAIL.test(email)?'error.email':!email.endsWith('@example.test')?'p6.syntheticEmail':s.teacher_invitations.some(x=>x.email===email&&invitationState(x)==='invited')?'p8.inviteExists':s.teachers.some(x=>s.users.find(u=>u.id===x.user_id)?.email===email)?'p8.alreadyTeacher':null,days:days?null:'error.required'});
+  if(Object.keys(errors).length)return failFields(errors);
+  const x={id:nextId(s.teacher_invitations,'TI'),email,teacher_id:null,invited_by:actor.user_id,status:'invited',expires_at:later(days),created_at:DEMO_NOW,updated_at:DEMO_NOW};
+  s.teacher_invitations.push(x);audit(s,actor,'teacher_invitation.create','teacher_invitation',x.id,'','invited',email);return ok({invitationId:x.id});
+ },
+ 'people.revokeInvite':(s,p,{actor,can})=>{
+  if(!staffCan(can,'people'))return fail('resourceDenied');
+  const x=s.teacher_invitations.find(v=>v.id===p.invitationId);if(!x)return fail('missing');
+  if(invitationState(x)!=='invited')return fail('p8.inviteNotOpen');
+  const r=reasonOf(p.reason);if(r.error)return failFields({reason:r.error});
+  Object.assign(x,{status:'revoked',updated_at:DEMO_NOW});audit(s,actor,'teacher_invitation.revoke','teacher_invitation',x.id,'invited','revoked',r.value);return ok({invitationId:x.id});
+ },
+ 'people.inviteEmployee':(s,p,{actor,can})=>{
+  if(!staffCan(can,'people','employees'))return fail('resourceDenied');
+  const email=text(p.email,120).toLowerCase(),name=text(p.name,80),days=STAFF_EXPIRY_DAYS.includes(String(p.days))?Number(p.days):null;
+  const errors=pick({name:lengthError(name,3),email:!email?'error.required':!EMAIL.test(email)?'error.email':!email.endsWith('@example.test')?'p6.syntheticEmail':s.users.some(u=>u.email===email)?'p8.emailTaken':null,role:INVITE_ROLES.includes(p.role)?null:'error.required',days:days?null:'error.required'});
+  if(Object.keys(errors).length)return failFields(errors);
+  const user={id:nextId(s.users.filter(u=>u.id.startsWith('U-STAFF-')),'U-STAFF'),name:typed(name),email,status:'invited',locale:'ar',mfa_state:'pending',created_at:DEMO_NOW,updated_at:DEMO_NOW};s.users.push(user);
+  const perms=s.permissions.map(x=>x.key).filter(k=>p.role==='admin_finance'?k.startsWith('finance.'):k.startsWith('people.')||k.startsWith('courses.'));
+  const ra={id:nextId(s.role_assignments,'RA'),user_id:user.id,role:p.role,permissions:perms,scope:p.role==='admin_finance'?{module:'finance'}:{modules:['people','courses','support']},effective_at:DEMO_NOW,expires_at:later(days),status:'invited',created_at:DEMO_NOW,updated_at:DEMO_NOW};
+  s.role_assignments.push(ra);audit(s,actor,'role_assignment.invite','role_assignment',ra.id,'','invited',p.role);return ok({assignmentId:ra.id,userId:user.id});
+ },
+ // Staff status/expiry. The acting owner's own assignment is protected so one accountable controller always remains.
+ 'people.updateEmployee':(s,p,{actor,can})=>{
+  if(!staffCan(can,'people','employees'))return fail('resourceDenied');
+  const ra=s.role_assignments.find(r=>r.id===p.assignmentId&&STAFF_ROLES.includes(r.role));if(!ra)return fail('missing');
+  if(ra.user_id===actor.user_id)return fail('p8.ownerProtected');
+  const status=['active','invited','suspended','deactivated'].includes(p.status)?p.status:null,expires=p.expires?datePart(p.expires):null,r=reasonOf(p.reason);
+  const errors=pick({status:status?null:'error.required',expires:p.expires&&(!expires||expires+'T19:59:59Z'<=DEMO_NOW)?'p8.dateFuture':null,reason:r.error});
+  if(Object.keys(errors).length)return failFields(errors);
+  const summary=()=>`${ra.status} · ${ra.expires_at?.slice(0,10)??'—'}`,before=summary();
+  Object.assign(ra,{status,expires_at:expires?expires+'T19:59:59Z':ra.expires_at,updated_at:DEMO_NOW});
+  const u=s.users.find(x=>x.id===ra.user_id);if(u)Object.assign(u,{status:['suspended','deactivated'].includes(status)?status:status==='active'?'active':u.status,updated_at:DEMO_NOW});
+  audit(s,actor,'role_assignment.update','role_assignment',ra.id,before,summary(),r.value);return ok({assignmentId:ra.id});
+ },
+ 'team.adminRevoke':(s,p,{actor,can})=>{
+  if(!staffCan(can,'people'))return fail('resourceDenied');
+  const m=s.teacher_team_members.find(x=>x.id===p.memberId);if(!m)return fail('missing');
+  const assignment=p.courseId?s.course_team_assignments.find(a=>a.team_member_id===m.id&&a.course_id===p.courseId&&a.status==='active'):null;
+  if(p.courseId&&!assignment)return fail('p8.assignmentNotActive');
+  if(!p.courseId&&!['active','invited'].includes(m.status))return fail('p8.memberNotActive');
+  const r=reasonOf(p.reason);if(r.error)return failFields({reason:r.error});
+  const before=assignment?`${p.courseId}:${assignment.capabilities.join('+')}`:m.status;
+  revokeTeamMember(s,m,assignment?[p.courseId]:null);
+  audit(s,actor,'team.admin_revoke','teacher_team_member',m.id,before,assignment?`${p.courseId}:revoked`:'deactivated',r.value);
+  notePerson(s,s.teachers.find(x=>x.id===m.teacher_id)?.user_id,{event:`team-admin-revoke-${m.id}-${s.audit_events.length}`,type:'team',title:{ar:'ألغت الإدارة صلاحية عضو في فريقك',en:'Administration revoked a team member’s access'},body:typed(r.value),href:'#/teacher/team'});
+  return ok({memberId:m.id});
+ },
+ // Academic taxonomy. Records are edited in place with an audited before/after trail (history), never deleted while
+ // referenced, and deactivation is refused while Published courses depend on the record.
+ 'academics.saveCurriculum':(s,p,{actor,can})=>{
+  if(!staffCan(can,'academics'))return fail('resourceDenied');
+  const code=text(p.code,20).toUpperCase(),n=bilingual(p,'name',3,120);
+  const errors=pick({code:!/^[A-Z0-9-]{2,20}$/.test(code)?'p8.codeInvalid':s.curricula.some(c=>c.code===code&&c.id!==p.id)?'p8.codeTaken':null,...n.errors});
+  if(Object.keys(errors).length)return failFields(errors);
+  return saveRecord(s,actor,{collection:'curricula',prefix:'CUR',type:'curriculum',id:p.id,values:{code,name:n.value},extra:{active:false},summary:x=>`${x.code} · ${x.name.en}`});
+ },
+ 'academics.saveVersion':(s,p,{actor,can})=>{
+  if(!staffCan(can,'academics'))return fail('resourceDenied');
+  const existing=p.id?s.curriculum_versions.find(v=>v.id===p.id):null;if(p.id&&!existing)return fail('missing');
+  const n=bilingual(p,'name',3,120),year=intIn(p.effective_year,2000,2100),curriculum=s.curricula.find(c=>c.id===(existing?.curriculum_id??p.curriculum_id));
+  const errors=pick({...n.errors,effective_year:year===null?'p8.yearInvalid':null,curriculum_id:curriculum?null:'error.required'});if(Object.keys(errors).length)return failFields(errors);
+  return saveRecord(s,actor,{collection:'curriculum_versions',prefix:'CV',type:'curriculum_version',id:p.id,values:{name:n.value,effective_year:year},extra:{curriculum_id:curriculum.id,active:false},summary:x=>`${x.name.en} · ${x.effective_year}`});
+ },
+ 'academics.saveTrack':(s,p,{actor,can})=>{
+  if(!staffCan(can,'academics'))return fail('resourceDenied');
+  const existing=p.id?s.tracks.find(v=>v.id===p.id):null;if(p.id&&!existing)return fail('missing');
+  const n=bilingual(p,'name',3,120),version=s.curriculum_versions.find(v=>v.id===(existing?.curriculum_version_id??p.curriculum_version_id));
+  const errors=pick({...n.errors,curriculum_version_id:version?null:'error.required'});if(Object.keys(errors).length)return failFields(errors);
+  return saveRecord(s,actor,{collection:'tracks',prefix:'TR',type:'track',id:p.id,values:{name:n.value},extra:{curriculum_version_id:version.id,active:false},summary:x=>x.name.en});
+ },
+ 'academics.setActive':(s,p,{actor,can})=>{
+  if(!staffCan(can,'academics'))return fail('resourceDenied');
+  const kind={curriculum:['curricula','curriculum'],version:['curriculum_versions','curriculum_version'],track:['tracks','track']}[p.kind];if(!kind)return fail('invalidAction');
+  const row=s[kind[0]].find(x=>x.id===p.id);if(!row)return fail('missing');
+  const active=p.active===true||p.active==='true';if(row.active===active)return ok({id:row.id,active,existing:true});
+  if(!active&&publishedDependants(s,p.kind,row.id))return fail('p8.inUsePublished');
+  Object.assign(row,{active,updated_at:DEMO_NOW});audit(s,actor,active?'academics.activate':'academics.deactivate',kind[1],row.id,active?'inactive':'active',active?'active':'inactive');
+  return ok({id:row.id,active});
+ },
+ 'academics.updateGrade':(s,p,{actor,can})=>{
+  if(!staffCan(can,'academics'))return fail('resourceDenied');
+  const g=s.grades.find(x=>x.id===p.id);if(!g)return fail('missing');
+  const n=bilingual(p,'name',3,60),c=bilingual(p,'cycle',3,80),errors=pick({...n.errors,...c.errors});if(Object.keys(errors).length)return failFields(errors);
+  const before=`${g.name.en} · ${g.cycle_label.en}`;Object.assign(g,{name:n.value,updated_at:DEMO_NOW});
+  // Cycle labels are shared by every grade in the same official cycle.
+  for(const x of s.grades.filter(v=>v.cycle_key===g.cycle_key))Object.assign(x,{cycle_label:structuredClone(c.value),updated_at:DEMO_NOW});
+  audit(s,actor,'grade.update','grade',g.id,before,`${n.value.en} · ${c.value.en}`);return ok({id:g.id});
+ },
+ 'academics.deleteGrade':(s,p,{actor,can})=>{
+  if(!staffCan(can,'academics'))return fail('resourceDenied');
+  const g=s.grades.find(x=>x.id===p.id);if(!g)return fail('missing');
+  if(s.grade_subjects.some(x=>x.grade_id===g.id)||s.students.some(x=>x.current_grade_id===g.id)||s.enrollments.some(x=>x.historical_grade_id===g.id))return fail('p8.gradeReferenced');
+  s.grades=s.grades.filter(x=>x.id!==g.id);audit(s,actor,'grade.delete','grade',g.id,g.name.en,'deleted');return ok({id:g.id});
+ },
+ 'academics.updateSubject':(s,p,{actor,can})=>{
+  if(!staffCan(can,'academics'))return fail('resourceDenied');
+  if(!s.subjects.some(v=>v.id===p.id))return fail('missing');
+  const n=bilingual(p,'name',2,60),d=bilingual(p,'description',10,300),errors=pick({...n.errors,...d.errors});if(Object.keys(errors).length)return failFields(errors);
+  return saveRecord(s,actor,{collection:'subjects',type:'subject',id:p.id,values:{name:n.value,description:d.value},summary:x=>x.name.en});
+ },
+ // Mapping toggles never reclassify courses: existing grade_subject_id references stay as they are.
+ 'academics.toggleMapping':(s,p,{actor,can})=>{
+  if(!staffCan(can,'academics'))return fail('resourceDenied');
+  const g=s.grades.find(x=>x.id===p.gradeId),x=s.subjects.find(v=>v.id===p.subjectId),version=s.curriculum_versions.find(v=>v.id===(p.versionId||'CV-001'));
+  if(!g||!x||!version)return fail('missing');
+  const row=s.grade_subjects.find(v=>v.curriculum_version_id===version.id&&v.grade_id===g.id&&v.subject_id===x.id);
+  if(row){Object.assign(row,{active:!row.active,updated_at:DEMO_NOW});audit(s,actor,row.active?'grade_subject.activate':'grade_subject.deactivate','grade_subject',row.id,row.active?'inactive':'active',row.active?'active':'inactive');return ok({id:row.id,active:row.active,courses:s.courses.filter(c=>c.grade_subject_id===row.id).length});}
+  const id=version.id==='CV-001'?`GS-${g.id}-${x.id}`:`GS-${version.id}-${g.id}-${x.id}`;
+  s.grade_subjects.push({id,curriculum_version_id:version.id,grade_id:g.id,subject_id:x.id,track_id:null,display_name:structuredClone(x.name),active:true,created_at:DEMO_NOW,updated_at:DEMO_NOW});
+  audit(s,actor,'grade_subject.create','grade_subject',id,'','active');return ok({id,active:true,courses:0});
+ },
+ 'academics.saveYear':(s,p,{actor,can})=>{
+  if(!staffCan(can,'academics'))return fail('resourceDenied');
+  const n=bilingual(p,'name',4,60),start=datePart(p.starts),end=datePart(p.ends);
+  const errors=pick({...n.errors,starts:start?null:'error.required',ends:!end?'error.required':start&&end<=start?'p8.dateOrder':null});if(Object.keys(errors).length)return failFields(errors);
+  return saveRecord(s,actor,{collection:'academic_years',prefix:'AY',type:'academic_year',id:p.id,values:{name:n.value,starts_at:start+'T00:00:00Z',ends_at:end+'T19:59:59Z'},summary:x=>`${x.name.en} · ${x.starts_at.slice(0,10)}–${x.ends_at.slice(0,10)}`});
+ },
+ 'academics.saveSemester':(s,p,{actor,can})=>{
+  if(!staffCan(can,'academics'))return fail('resourceDenied');
+  const existing=p.id?s.semesters.find(v=>v.id===p.id):null;if(p.id&&!existing)return fail('missing');
+  const year=s.academic_years.find(y=>y.id===(existing?.academic_year_id??p.academic_year_id)),n=bilingual(p,'name',3,60),sequence=intIn(p.sequence,1,4),start=datePart(p.starts),end=datePart(p.ends);
+  const inYear=v=>!year||(v+'T19:59:59Z'>=year.starts_at&&v+'T00:00:00Z'<=year.ends_at);
+  const errors=pick({...n.errors,academic_year_id:year?null:'error.required',sequence:sequence===null?'p8.sequenceInvalid':null,starts:!start?'error.required':!inYear(start)?'p8.outsideYear':null,ends:!end?'error.required':start&&end<=start?'p8.dateOrder':!inYear(end)?'p8.outsideYear':null});
+  if(Object.keys(errors).length)return failFields(errors);
+  return saveRecord(s,actor,{collection:'semesters',prefix:'SEM',type:'semester',id:p.id,values:{name:n.value,sequence,starts_at:start+'T00:00:00Z',ends_at:end+'T19:59:59Z'},extra:{academic_year_id:year.id},summary:x=>`${x.name.en} · ${x.starts_at.slice(0,10)}–${x.ends_at.slice(0,10)}`});
+ },
+ // Side-by-side AR/EN labels for subjects and grade-subject mappings; any missing label rejects the whole save.
+ 'academics.saveTranslations':(s,p,{actor,can})=>{
+  if(!staffCan(can,'academics'))return fail('resourceDenied');
+  const subjects=p.subjects&&typeof p.subjects==='object'?Object.entries(p.subjects):[],mappings=p.mappings&&typeof p.mappings==='object'?Object.entries(p.mappings):[],errors={},changes=[];
+  if(!subjects.length&&!mappings.length)return fail('invalidAction');
+  const label=(key,v)=>{const ar=text(v?.ar,60),en=text(v?.en,60);if(!ar)errors[key+'_ar']='p8.labelMissing';if(!en)errors[key+'_en']='p8.labelMissing';return {ar,en};};
+  const rows=[...subjects.map(([id,v])=>[s.subjects.find(x=>x.id===id),'name',label('s_'+id.replace(/-/g,'_'),v)]),...mappings.map(([id,v])=>[s.grade_subjects.find(x=>x.id===id),'display_name',label('m_'+id.replace(/-/g,'_'),v)])];
+  if(rows.some(([row])=>!row))return fail('missing');
+  if(Object.keys(errors).length)return failFields(errors,'p8.labelsMissing');
+  for(const [row,key,v] of rows)if(row[key].ar!==v.ar||row[key].en!==v.en){changes.push(row.id);Object.assign(row,{[key]:v,updated_at:DEMO_NOW});}
+  if(changes.length)audit(s,actor,'translation.update','translation',changes.length===1?changes[0]:`${changes.length} labels`,'',changes.join(', '));
+  return ok({changed:changes.length});
+ },
+ // Course operations: unpublish/archive/explicit moderated republish, each reasoned, audited and notified to the owner.
+ 'course.moderate':(s,p,{actor,can})=>{
+  if(!staffCan(can,'courses'))return fail('resourceDenied');
+  const c=s.courses.find(x=>x.id===p.courseId);if(!c)return fail('missing');
+  const rule=Object.hasOwn(COURSE_MODERATION,p.action)?COURSE_MODERATION[p.action]:null;if(!rule)return fail('invalidAction');
+  if(c.status===rule.to)return ok({id:c.id,status:c.status,existing:true});
+  if(!rule.from.includes(c.status))return fail('p6.invalidTransition');
+  const r=reasonOf(p.reason);if(r.error)return failFields({reason:r.error});
+  if(p.action==='republish'){if(!qualifiedPairs(s,c.owner_teacher_id).has(c.grade_subject_id))return fail('p6.notQualified');if(checklistBlocked(s,c))return fail('p6.checklistIncomplete');}
+  const before=c.status;Object.assign(c,{status:rule.to,updated_at:DEMO_NOW});
+  if(c.unpublish_request?.state==='requested'&&rule.to!=='Published')c.unpublish_request={...c.unpublish_request,state:'resolved',resolved_at:DEMO_NOW};
+  audit(s,actor,'course.'+p.action,'course',c.id,before,rule.to,r.value);
+  notePerson(s,s.teachers.find(x=>x.id===c.owner_teacher_id)?.user_id,{event:`course-moderate-${c.id}-${s.audit_events.length}`,type:'course_moderation',title:{unpublish:{ar:'أُلغي نشر دورتك',en:'Your course was unpublished'},archive:{ar:'أُرشفت دورتك',en:'Your course was archived'},republish:{ar:'أُعيد نشر دورتك',en:'Your course was republished'}}[p.action],body:structuredClone(editView(c).title),href:`#/teacher/course/${c.id}?tab=details`,courseId:c.id});
+  return ok({id:c.id,status:c.status});
+ },
+ // Content reports: restrict records a moderation hold on the course pending review (shown to staff), unpublish takes
+ // the course down, resolve closes the report and lifts this report's hold. Each needs a reason and is audited.
+ 'report.act':(s,p,ctx)=>{
+  const {actor,can}=ctx;if(!staffCan(can,'courses'))return fail('resourceDenied');
+  const rep=s.safety_reports.find(x=>x.id===p.reportId&&!isMessageReport(x));if(!rep)return fail('missing');
+  if(!['restrict','unpublish','resolve'].includes(p.action))return fail('invalidAction');
+  if(rep.state==='resolved')return fail('p8.reportResolved');
+  const r=reasonOf(p.reason);if(r.error)return failFields({reason:r.error});
+  const c=s.courses.find(x=>x.id===rep.course_id),before=rep.state;
+  if(p.action==='restrict'){Object.assign(c,{content_restriction:{report_id:rep.id,reason:typed(r.value),at:DEMO_NOW,by:actor.user_id},updated_at:DEMO_NOW});Object.assign(rep,{state:'escalated',assigned_staff_id:actor.user_id,updated_at:DEMO_NOW});audit(s,actor,'course.restrict','course',c.id,'','restricted',r.value);}
+  else {
+   if(p.action==='unpublish'){const res=reducers['course.moderate'](s,{courseId:c.id,action:'unpublish',reason:r.value},ctx);if(!res.ok)return res;}
+   if(c.content_restriction?.report_id===rep.id)c.content_restriction=null;
+   Object.assign(rep,{state:'resolved',resolution:r.value,assigned_staff_id:actor.user_id,updated_at:DEMO_NOW});
+  }
+  audit(s,actor,'report.'+p.action,'safety_report',rep.id,before,rep.state,r.value);return ok({reportId:rep.id,state:rep.state});
+ },
+ // Explicit staff entitlement: admin_grant origin with a stated validity window; orders and payments are never touched.
+ 'access.adminGrant':(s,p,{actor,can})=>{
+  if(!staffCan(can,'courses'))return fail('resourceDenied');
+  const st=s.students.find(x=>x.id===p.studentId),c=s.courses.find(x=>x.id===p.courseId),end=p.ends?datePart(p.ends):null,r=reasonOf(p.reason);
+  const errors=pick({studentId:st?null:'error.required',courseId:!c?'error.required':!['Published','Unpublished','Archived'].includes(c.status)?'p8.courseNotGrantable':st&&activeGrantIn(s,st.id,c.id)?'p8.grantExists':null,ends:!end?'error.required':end+'T19:59:59Z'<=DEMO_NOW?'p8.dateFuture':null,reason:r.error});
+  if(Object.keys(errors).length)return failFields(errors);
+  let e=s.enrollments.find(x=>x.student_id===st.id&&x.course_id===c.id);
+  if(e&&e.status!=='active')return failFields({studentId:'error.enrollmentSuspended'});
+  if(!e){e={id:nextId(s.enrollments,'EN'),student_id:st.id,course_id:c.id,status:'active',started_at:DEMO_NOW,historical_grade_id:st.current_grade_id,created_at:DEMO_NOW,updated_at:DEMO_NOW};s.enrollments.push(e);}
+  const g={id:nextId(s.access_grants,'AG'),student_id:st.id,course_id:c.id,enrollment_id:e.id,origin:'admin_grant',source_id:null,starts_at:DEMO_NOW,ends_at:end+'T19:59:59Z',status:'active',granted_by:actor.user_id,reason:r.value,created_at:DEMO_NOW,updated_at:DEMO_NOW};
+  s.access_grants.push(g);audit(s,actor,'access_grant.create','access_grant',g.id,'','active',r.value);
+  notePerson(s,st.user_id,{event:'admin-grant-'+g.id,type:'enrollment',title:{ar:'تم منحك وصولاً إلى دورة',en:'You were granted course access'},body:structuredClone(editView(c).title),href:'#/student/course/'+c.id,courseId:c.id});
+  return ok({grantId:g.id,enrollmentId:e.id});
+ },
+ 'access.revokeGrant':(s,p,{actor,can})=>{
+  if(!staffCan(can,'courses'))return fail('resourceDenied');
+  const g=s.access_grants.find(x=>x.id===p.grantId);if(!g)return fail('missing');
+  if(g.status!=='active')return fail('p8.grantNotActive');
+  const r=reasonOf(p.reason);if(r.error)return failFields({reason:r.error});
+  Object.assign(g,{status:'revoked',revoked_by:actor.user_id,revoke_reason:r.value,updated_at:DEMO_NOW});audit(s,actor,'access_grant.revoke','access_grant',g.id,'active','revoked',r.value);return ok({grantId:g.id});
+ },
+ 'live.addIncident':(s,p,{actor,can})=>{
+  if(!staffCan(can,'courses'))return fail('resourceDenied');
+  const x=s.live_sessions.find(v=>v.id===p.sessionId);if(!x)return fail('missing');
+  const note=text(p.note,600),error=note&&note.length<10?'error.messageShort':lengthError(note,10);if(error)return failFields({note:error});
+  const list=x.incident_notes??=[];list.push({id:`${x.id}-INC-${list.length+1}`,text:note,author_user_id:actor.user_id,created_at:DEMO_NOW});x.updated_at=DEMO_NOW;
+  audit(s,actor,'live_session.incident','live_session',x.id,x.status,'incident_note',note);return ok({sessionId:x.id});
+ },
+ // Support desk. Responding requires a prior reasoned read of the thread; resolution requires its own reason.
+ 'support.staffRespond':(s,p,{actor,can})=>{
+  if(!staffCan(can,'support'))return fail('resourceDenied');
+  const x=s.support_tickets.find(v=>v.id===p.ticketId);if(!x)return fail('missing');
+  if(!revealed(s,'ticket',x.id))return fail('p8.reasonFirst');
+  if(x.state==='resolved')return fail('p8.ticketResolved');
+  const body=text(p.text,2000),error=lengthError(body,2);if(error)return failFields({text:error});
+  (x.replies??=[]).push({id:`${x.id}-R${x.replies.length+1}`,author_user_id:actor.user_id,text:body,lang:s.preferences.lang,created_at:DEMO_NOW});
+  const before=x.state;Object.assign(x,{state:'waiting',assigned_staff_id:actor.user_id,updated_at:DEMO_NOW});
+  audit(s,actor,'support.respond','support_ticket',x.id,before,'waiting');
+  notePerson(s,x.requester_user_id,{event:`ticket-reply-${x.id}-${x.replies.length}`,type:'support',title:{ar:'رد فريق الدعم على طلبك',en:'Support replied to your request'},body:structuredClone(x.subject),href:roleOfUser(s,x.requester_user_id)==='guardian'?'#/guardian/support?record='+x.id:null});
+  return ok({ticketId:x.id});
+ },
+ 'support.resolveTicket':(s,p,{actor,can})=>{
+  if(!staffCan(can,'support'))return fail('resourceDenied');
+  const x=s.support_tickets.find(v=>v.id===p.ticketId);if(!x)return fail('missing');
+  if(x.state==='resolved')return ok({ticketId:x.id,existing:true});
+  const r=reasonOf(p.reason);if(r.error)return failFields({reason:r.error});
+  const before=x.state;Object.assign(x,{state:'resolved',resolution:r.value,assigned_staff_id:x.assigned_staff_id??actor.user_id,updated_at:DEMO_NOW});
+  audit(s,actor,'support.resolve','support_ticket',x.id,before,'resolved',r.value);
+  notePerson(s,x.requester_user_id,{event:`ticket-resolved-${x.id}-${s.audit_events.length}`,type:'support',title:{ar:'تم حل طلب الدعم',en:'Support request resolved'},body:structuredClone(x.subject),href:roleOfUser(s,x.requester_user_id)==='guardian'?'#/guardian/support?record='+x.id:null});
+  return ok({ticketId:x.id});
+ },
+ 'safety.setState':(s,p,{actor,can})=>{
+  if(!staffCan(can,'support'))return fail('resourceDenied');
+  const rep=s.safety_reports.find(x=>x.id===p.reportId&&isMessageReport(x));if(!rep)return fail('missing');
+  if(!(SAFETY_NEXT[rep.state]??[]).includes(p.state))return fail('p6.invalidTransition');
+  const r=reasonOf(p.reason);if(r.error)return failFields({reason:r.error});
+  const before=rep.state;(rep.review_notes??=[]).push({id:`${rep.id}-N${rep.review_notes.length+1}`,text:r.value,state:p.state,author_user_id:actor.user_id,created_at:DEMO_NOW});
+  Object.assign(rep,{state:p.state,assigned_staff_id:actor.user_id,updated_at:DEMO_NOW,...(p.state==='resolved'?{resolution:r.value}:{})});
+  audit(s,actor,'safety.'+p.state,'safety_report',rep.id,before,p.state,r.value);
+  if(p.state==='escalated')for(const u of userRoleIds(s,'super_admin'))if(u!==actor.user_id)notePerson(s,u,{event:`safety-escalated-${rep.id}-${s.audit_events.length}`,type:'safety',title:{ar:'بلاغ تواصل مصعّد',en:'Communication report escalated'},body:structuredClone(rep.reason),href:'#/admin/support/communications?record='+rep.id});
+  return ok({reportId:rep.id,state:rep.state});
+ },
+ 'message.moderate':(s,p,{actor,can})=>{
+  if(!staffCan(can,'support'))return fail('resourceDenied');
+  const m=s.messages.find(x=>x.id===p.messageId);if(!m)return fail('missing');
+  const from={remove:['visible','flagged'],restore:['removed'],clear:['flagged']}[p.decision];if(!from)return fail('invalidAction');
+  if(!from.includes(m.moderation_state))return fail('p6.invalidTransition');
+  const r=reasonOf(p.reason);if(r.error)return failFields({reason:r.error});
+  const before=m.moderation_state;Object.assign(m,{moderation_state:p.decision==='remove'?'removed':'visible',updated_at:DEMO_NOW});
+  audit(s,actor,'message.'+p.decision,'message',m.id,before,m.moderation_state,r.value);return ok({messageId:m.id,state:m.moderation_state});
+ },
+ // CMS. Saved copy is exactly what the public selectors (homeBanner, featuredCourses, cmsPage, faqs) read.
+ 'cms.saveHome':(s,p,{actor,can})=>{
+  if(!staffCan(can,'cms'))return fail('resourceDenied');
+  const home=s.cms_pages.find(x=>x.slug==='home');if(!home)return fail('missing');
+  const t1=bilingual(p,'title',5,120),b1=bilingual(p,'body',10,300),featured=[...new Set(Array.isArray(p.featured)?p.featured.filter(x=>typeof x==='string'):[])];
+  const errors=pick({...t1.errors,...b1.errors,featured:!featured.length?'p8.featuredRequired':featured.length>8?'p8.featuredMax':featured.some(id=>{const c=s.courses.find(x=>x.id===id);return !c||!isPublic(s,c);})?'p8.featuredInvalid':null});
+  if(Object.keys(errors).length)return failFields(errors);
+  const banner=home.sections.find(x=>x.kind==='banner'),before=banner?.title.en??'';
+  if(banner)Object.assign(banner,{title:t1.value,body:b1.value});else home.sections.unshift({kind:'banner',title:t1.value,body:b1.value});
+  const f=home.sections.find(x=>x.kind==='featured');if(f)f.course_ids=featured;else home.sections.push({kind:'featured',course_ids:featured});
+  home.updated_at=DEMO_NOW;audit(s,actor,'cms.update_home','cms_page',home.id,before,`${t1.value.en} · ${featured.join(',')}`);return ok({pageId:home.id});
+ },
+ 'cms.savePage':(s,p,{actor,can})=>{
+  if(!staffCan(can,'cms'))return fail('resourceDenied');
+  const page=s.cms_pages.find(x=>x.slug===p.slug&&x.slug!=='home');if(!page)return fail('missing');
+  const t1=bilingual(p,'title',3,120),b1=bilingual(p,'body',10,1000),errors=pick({...t1.errors,...b1.errors});if(Object.keys(errors).length)return failFields(errors);
+  const before=page.title.en;Object.assign(page,{title:t1.value,body:b1.value,updated_at:DEMO_NOW});
+  // Policy copy can never become "approved" from the demo editor.
+  if(['privacy','terms','refunds'].includes(page.slug))page.status='draft';
+  audit(s,actor,'cms.update_page','cms_page',page.id,before,t1.value.en);return ok({pageId:page.id,status:page.status});
+ },
+ 'cms.saveFaq':(s,p,{actor,can})=>{
+  if(!staffCan(can,'cms'))return fail('resourceDenied');
+  const help=s.cms_pages.find(x=>x.slug==='help'),faqs=help.sections.filter(x=>x.kind==='faq'),fresh=p.index===''||p.index==null,index=fresh?null:intIn(p.index,0,faqs.length-1);
+  if(!fresh&&index===null)return fail('missing');
+  const t1=bilingual(p,'title',5,160),b1=bilingual(p,'body',10,600),errors=pick({...t1.errors,...b1.errors});if(Object.keys(errors).length)return failFields(errors);
+  if(fresh)help.sections.push({kind:'faq',title:t1.value,body:b1.value});else Object.assign(faqs[index],{title:t1.value,body:b1.value});
+  help.updated_at=DEMO_NOW;audit(s,actor,fresh?'cms.add_faq':'cms.update_faq','cms_page',help.id,'',t1.value.en);return ok({index:fresh?faqs.length:index});
+ },
+ 'cms.removeFaq':(s,p,{actor,can})=>{
+  if(!staffCan(can,'cms'))return fail('resourceDenied');
+  const help=s.cms_pages.find(x=>x.slug==='help'),faqs=help.sections.filter(x=>x.kind==='faq'),index=intIn(p.index,0,faqs.length-1);if(index===null)return fail('missing');
+  const target=faqs[index];help.sections=help.sections.filter(x=>x!==target);help.updated_at=DEMO_NOW;audit(s,actor,'cms.remove_faq','cms_page',help.id,target.title.en,'removed');return ok({index});
+ },
+ 'template.save':(s,p,{actor,can})=>{
+  if(!staffCan(can,'notifications'))return fail('resourceDenied');
+  const x=s.notification_templates.find(v=>v.id===p.templateId);if(!x)return fail('missing');
+  const sub=bilingual(p,'subject',3,120),body=bilingual(p,'body',10,600),errors=pick({...sub.errors,...body.errors});
+  // Both languages must keep the template's placeholders so delivery data still fills them.
+  const expected=placeholders(x.body.en);
+  if(!errors.body_ar&&placeholders(body.value.ar)!==expected)errors.body_ar='p8.placeholderMismatch';
+  if(!errors.body_en&&placeholders(body.value.en)!==expected)errors.body_en='p8.placeholderMismatch';
+  if(Object.keys(errors).length)return failFields(errors);
+  const enabled=p.enabled===true||p.enabled==='on',summary=()=>`${x.subject.en} · ${x.enabled?'on':'off'}`,before=summary();
+  Object.assign(x,{subject:sub.value,body:body.value,enabled,updated_at:DEMO_NOW});audit(s,actor,'notification_template.update','notification_template',x.id,before,summary());return ok({templateId:x.id});
+ },
+ // Simulated redelivery of the same notification: its event ID (deduplication key) and record are reused, never
+ // re-created; an attempt that is already delivered returns success without change.
+ 'delivery.retry':(s,p,{actor,can})=>{
+  if(!staffCan(can,'notifications'))return fail('resourceDenied');
+  const a=s.delivery_attempts.find(x=>x.id===p.attemptId);if(!a)return fail('missing');
+  const n=s.notifications.find(x=>x.id===a.notification_id);
+  if(['sent','read'].includes(a.state))return ok({attemptId:a.id,eventId:n?.event_id??null,existing:true});
+  const before=a.state;Object.assign(a,{state:'sent',attempts:a.attempts+1,last_error:'',retried_at:DEMO_NOW,updated_at:DEMO_NOW});
+  audit(s,actor,'delivery.retry','delivery_attempt',a.id,before,'sent',n?.event_id??'');return ok({attemptId:a.id,eventId:n?.event_id??null,existing:false});
+ },
+ // Roles: audited demo changes. The acting owner's settings.manage_roles and the independent payout approval rule
+ // (approver ≠ preparer, enforced in can()) cannot be removed here.
+ 'roles.save':(s,p,{actor,can})=>{
+  if(!staffCan(can,'settings'))return fail('resourceDenied');
+  if(p.independentApproval===false||p.independentApproval==='false')return fail('p8.independentLocked');
+  const ra=s.role_assignments.find(r=>r.id===p.assignmentId);if(!ra)return fail('missing');
+  const keys=s.permissions.map(x=>x.key);if(!Array.isArray(p.permissions)||p.permissions.some(k=>!keys.includes(k)))return fail('invalidAction');
+  const permissions=keys.filter(k=>p.permissions.includes(k)),expires=p.expires?datePart(p.expires):null,r=reasonOf(p.reason);
+  const errors=pick({permissions:!permissions.length?'p8.permissionRequired':ra.user_id===actor.user_id&&!permissions.includes('settings.manage_roles')?'p8.ownerCoreControl':null,expires:p.expires&&(!expires||expires+'T19:59:59Z'<=DEMO_NOW)?'p8.dateFuture':null,reason:r.error});
+  if(Object.keys(errors).length)return failFields(errors);
+  const summary=()=>`${ra.permissions.length} · ${ra.expires_at?.slice(0,10)??'—'}`,before=summary();
+  Object.assign(ra,{permissions,expires_at:expires?expires+'T19:59:59Z':ra.expires_at,updated_at:DEMO_NOW});
+  audit(s,actor,'role_assignment.update','role_assignment',ra.id,before,summary(),r.value);return ok({assignmentId:ra.id});
+ },
+ // Mock MFA/session controls; nothing here claims real authentication.
+ 'security.update':(s,p,{actor,can})=>{
+  if(!staffCan(can,'settings'))return fail('resourceDenied');
+  const u=s.users.find(x=>x.id===p.userId&&s.role_assignments.some(r=>r.user_id===x.id&&STAFF_ROLES.includes(r.role)));if(!u)return fail('missing');
+  if(!['resetMfa','markEnrolled','revokeSessions'].includes(p.action))return fail('invalidAction');
+  if(u.id===actor.user_id&&p.action!=='revokeSessions')return fail('p8.ownerProtected');
+  const r=reasonOf(p.reason);if(r.error)return failFields({reason:r.error});
+  const before=u.mfa_state??'enrolled';
+  if(p.action==='revokeSessions')u.sessions_revoked_at=DEMO_NOW;else u.mfa_state=p.action==='resetMfa'?'pending':'enrolled';
+  u.updated_at=DEMO_NOW;audit(s,actor,'security.'+p.action,'security',u.id,before,p.action==='revokeSessions'?'sessions_revoked':u.mfa_state,r.value);return ok({userId:u.id});
+ },
+ 'integration.test':(s,p,{actor,can})=>{
+  if(!staffCan(can,'settings'))return fail('resourceDenied');
+  const set=s.platform_settings[0];if(typeof p.key!=='string'||!Object.hasOwn(set.integration_statuses,p.key))return fail('missing');
+  const n=(set.integration_tests?.[p.key]?.run??0)+1;
+  (set.integration_tests??={})[p.key]={run:n,at:DEMO_NOW,outcome:'simulated_ok',latency_ms:120+Object.keys(set.integration_statuses).indexOf(p.key)*37+n*3,reference:`SIM-${p.key.toUpperCase()}-${String(n).padStart(3,'0')}`};
+  audit(s,actor,'integration.test','integration',p.key,'','simulated_ok');return ok({...set.integration_tests[p.key]});
  },
 });

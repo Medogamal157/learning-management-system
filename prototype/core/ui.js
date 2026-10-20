@@ -13,10 +13,10 @@ export function statCard({label,value,delta=null,icon:iconName=null,trend=[],hre
 // Tone per exact state (SPEC §3.1): neutral draft/inactive, info in progress, warning waiting/held,
 // success approved/complete, danger rejected/failed/revoked. Unknown keys are never shown as success.
 const TONES={
- success:new Set(['active','approved','Approved','Published','published','paid','Paid','succeeded','verified','done','completed','released','read','sent','won','ready','resolved','recording_ready','recording_published']),
- warning:new Set(['pending','Pending','pending_verification','requested','submitted','Submitted','UnderReview','under_review','waiting','reserved','more_info_required','ChangesRequested','escalated','rescheduled','queued','invited','partially_refunded']),
- info:new Set(['in_progress','processing','Processing','assigned','live','scheduled','in_payout','initiated','recording_processing','open','graded']),
- danger:new Set(['rejected','Rejected','failed','Failed','revoked','lost','suspended']),
+ success:new Set(['active','approved','Approved','Published','published','paid','Paid','succeeded','verified','done','completed','released','read','sent','won','ready','resolved','recording_ready','recording_published','accepted','enrolled','confirmed','visible']),
+ warning:new Set(['pending','Pending','pending_verification','requested','submitted','Submitted','UnderReview','under_review','waiting','reserved','more_info_required','ChangesRequested','escalated','rescheduled','queued','invited','partially_refunded','flagged']),
+ info:new Set(['in_progress','processing','Processing','assigned','live','scheduled','in_payout','initiated','recording_processing','open','graded','simulated','proposed']),
+ danger:new Set(['rejected','Rejected','failed','Failed','revoked','lost','suspended','removed']),
 };
 const TONE_ICONS={success:'checkCircle',warning:'clock',info:'refresh',danger:'x',neutral:'fileText'};
 export function badge(status,{domain,size='sm'}={}) { const key=`status.${domain}.${status}`,known=Object.hasOwn(dictionary,key);const tone=known?Object.keys(TONES).find(k=>TONES[k].has(status))??'neutral':'neutral';return `<span class="chip tone-${tone} ${size==='lg'?'text-base':'text-sm'}">${icon(known?TONE_ICONS[tone]:'helpCircle',{size:14})}<span>${esc(t(known?key:'unknown'))}</span></span>`; }
